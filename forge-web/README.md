@@ -157,8 +157,9 @@ value 用于 input 的文本/数字与 amount 的 CSV)。
 **超时兜底**:`awaitDecision` 默认**无限等待**(不打断真人);`WebGuiGame.setDecisionTimeoutMs(ms)`
 可设一个较长超时,超时后走安全默认。
 
-**仍为默认桩(`[WEB-TODO]`,绝不阻塞无头)**:`sideboard`(保留原套牌,只在 match 换局间触发)、
-`manipulateCardList`(保持原顺序)。这两个需要更专门的 UI,留待后续。
+`manipulateCardList`(占卜/探究等排序)也接成**逐个单选** `choose` 往返(默认保持原顺序)。
+
+**仍为默认桩(`[WEB-TODO]`,绝不阻塞无头)**:`sideboard` —— 单局 vs AI 用不到(只在 match 换局间触发),保留原套牌。
 
 **无头 SmokeTest**:自动驾驶检测到 `hasPendingDecision()` 就 `answerPendingDefault()`(用 null 完成
 future → 各方法走默认),因此**整局能跑到自然 game-over**。启动时的 mulligan/coin-toss 走 Input 框架
@@ -173,27 +174,34 @@ future → 各方法走默认),因此**整局能跑到自然 game-over**。启�
 | `GameViewSerializer` | GameView → 契约 JSON(纯函数);`resolveImage` 填 id/zh/img/imgen |
 | `Json` | 极简 JSON 读写(无第三方依赖):`write` 出契约,`parse` 读 `card_index.json` |
 | `CardIndex` | 英文名 → {Scryfall id, 中文名} 单例,从 classpath 的 `card_index.json` 加载 |
-| `WebGuiGame extends AbstractGuiGame` | IGuiGame 实现:状态推送 + `submitAction`(action)回喂 + `awaitDecision/answerDecision`(decision 往返) |
-| `WebGuiBase extends GuiDesktop` | 无头 GuiBase;`getNewGuiGame()` 返回共享的 WebGuiGame |
-| `MatchBootstrap` | 装 GuiBase、`FModel.initialize`、造两副牌、`HostedMatch.startMatch(...)` |
-| `WebMatchServer` | org.java_websocket 服务:广播状态 / 解析 action 与 decide 回传 |
-| `BridgeApp` | main:起 WS + 开局 |
-| `SmokeTest` | main:自动过优先权 + 落盘每步 JSON |
+| `WebGuiGame extends AbstractGuiGame` | 每局一个实例:状态推送 + `submitAction`(action)+ `awaitDecision/answerDecision`(decision)+ `stop()`(断线清理) |
+| `WebGuiBase extends GuiDesktop` | 无头 GuiBase;`getNewGuiGame()` 返回全新 WebGuiGame(每局独立) |
+| `MatchBootstrap` | `ensureInitialized()` 全局一次;`startHumanVsAi(gui, deck)` 每局独立开一桌 |
+| `DeckParser` | Arena 牌表文本 → Forge `Deck`(用 `DeckRecognizer`);`copyForAi` 造 AI 副本 |
+| `WebMatchServer` | org.java_websocket:**每连接一局**;解析 newgame/action/decide;断线清理 |
+| `BridgeApp` | main:全局初始化 + 起 WS(不预开局) |
+| `SmokeTest` | main:自动应答 + 落盘每步 JSON;`-Dmdc.deck.file=` 可注入牌表 |
 
-启动序列(见 `HostedMatch.startGame`,本桥用其 `startMatch` 高层入口):
-`GuiBase.setInterface(WebGuiBase)` → `FModel.initialize` → 建 `RegisteredPlayer`(human=`GamePlayerUtil.getGuiPlayer()`,ai=`createAiPlayer()`)→ `new HostedMatch().startMatch(Constructed, null, players, humanRp, webGui)`。HostedMatch 内部完成 `setGui/setOriginalGameController/subscribeToEvents(FControlGameEventHandler)/openView`,并在 Forge 游戏线程上 `match.startGame()`(阻塞等输入)。
+### 5.1 每连接独立对局
+- `WebMatchServer` 给每个 WS 连接维护一个 `Session{gui}`。连接建立先推一个 lobby 占位帧,**不开局**。
+- 收到 `{"id":"newgame","deck":...}` 才开:新建 `WebGuiGame`(sink 只发给本连接)→ `DeckParser.parseArena` →
+  `MatchBootstrap.startHumanVsAi(gui, deck)`(独立 `HostedMatch`,跑在各自的 Forge 游戏线程,可并发)。
+- action/decide 只喂本连接的 gui;断线 `gui.stop()`(认输 + 解阻塞 + 关输入线程)。`FModel.initialize` 仍全局一次。
+- 并发安全:每局用**全新** `LobbyPlayerHuman`(非单例)、独立 Game 对象;卡库 `StaticData` 只读共享。
+
+### 5.2 注入牌组
+- `deck` = MTGA/Arena 牌表:`Deck` 段 + `<数量> <英文名>` 行 +(可选)`Sideboard` 段。`DeckRecognizer`(forge-core,无 GUI,permissive)解析,认不出的行跳过并 log。
+- **AI 对手** = 人类牌组的副本(`DeckParser.copyForAi`,公平镜像)。无 deck/空 deck → 默认牌组(34 树林 + 26 灰棕熊)。
 
 ---
 
 ## 6. 前端对接(已接)
 
-`MagicDraftCommunity/mdc-web/battle.html` 已改成 WebSocket 数据源:
-- `connect()` → `ws://<location.hostname>:8899`(端口可用 `window.MDC_WS_PORT` 覆盖);
-  `onmessage` → `render(JSON.parse(...))`;断线 2s 自动重连;**连不上 1.5s 内回退 `fetch(mock_gameview.json)`**(离线仍可看)。
-- `actions[]`(pass/play/select)按钮点击 → `send({id,cardId})`。
-- 当帧带 `decision` 时弹**决策面板** `renderDecision(dec)`:confirm/option/ability=按钮;input=输入框;
-  choose/chooseEntity/chooseEntities=可多选(卡类选项显示卡图,带 min/max 校验);amount=各目标数字框(校验和=amount)。
-  选完 `send({id:"decide",reqId,picks,value})`。
+`MagicDraftCommunity/mdc-web/battle.html`:
+- 连上先收 lobby 帧 → 弹**开战前面板**:文本框(牌表来源优先级 **URL `?deck=`(base64 或 encodeURIComponent)→ `localStorage["mdc_deck"]` → 空**)+ 「用牌组开战」/「快速对战(默认牌组)」两个入口。
+- 点开战 → `send({id:"newgame",deck})`(快速对战不带 deck)。断线重连自动用上次牌组重新 `newgame`。
+- `actions[]`(pass/play/select)→ `send({id,cardId})`;`decision` 帧 → 决策面板 → `send({id:"decide",reqId,picks,value})`。
+- WS 连不上 → 回退 `mock_gameview.json`(离线预览,跳过开战面板)。轮抽页把导出牌表写进 `localStorage["mdc_deck"]` 后打开本页即可。
 
 ---
 
@@ -243,16 +251,17 @@ MDC_WS_HOST=0.0.0.0 MDC_WS_PORT=9000 java -Dmdc.assetsDir=/path/… -jar forge-w
 ## 8. 已知缺口 / 下一步
 
 1. **图/中文覆盖率**:靠英文名精确匹配 `card_index.json`;个别异画名/双面背面/异名可能查不到 → 回退 Forge id、`img/zh` 空。DFC 背面图暂用 front 路径。
-2. **仍为默认桩的决策**:`sideboard`、`manipulateCardList`。
+2. **仍为默认桩的决策**:`sideboard`(单局 vs AI 用不到)。
 3. **actions 精确化**:优先权空闲态"可出的牌"依赖 `setSelectables`,实测未必含地牌;可改为直接查引擎可用 SpellAbility 生成 `play`。
+4. **AI 牌组**:目前用人类牌组的副本(公平镜像);后续可换成按颜色/主题选一套预设强度更合适的对手。
 
 ---
 
 ## 9. 验证记录
 
-- `mvn -pl forge-web -am -DskipTests package`:通过,产出 `forge-web-2.0.15-SNAPSHOT-shaded.jar`(~42MB,含 card_index.json)。
-- **胖包 SmokeTest**(中立 cwd + `-Dmdc.assetsDir`,全 res):跑到**自然 game-over**(6383 步),`zh/img/imgen` 已填(如 Grizzly Bears→灰棕熊)。
-- **胖包 SmokeTest + 最小 res(210M)**:正常起局、双方回合、全阶段(308 步截断验证),仅 `deckgendecks` 非致命报错。
-- **中文/图**(独立):Mountain / Grizzly Bears(灰棕熊)/ Sheoldred(启示天灾希欧蕊)→ 正确 Scryfall id + 中文 + mtgch URL;未命中回退 Forge id。
-- **决策往返**(独立):`confirm`→false、`getChoices`→[C]、`showInputDialog`→"7"。
-- 早前:实时 `BridgeApp` + WS 客户端 400 帧双回合全阶段;`battle.html` JS `node --check` 通过。
+- `mvn -pl forge-web -am -DskipTests package`:通过,产出 `forge-web-2.0.15-SNAPSHOT-shaded.jar`(~42MB,含 card_index.json + 每连接对局 + 牌组注入)。
+- **牌组注入 → game-over**:`SmokeTest -Dmdc.deck.file=<Arena牌表>`,解析 60 张主牌(0 跳过),跑到**自然 game-over**(777 步),对局中只出现注入牌组的卡(Forest/Mountain/Grizzly Bears/Llanowar Elves)。
+- **并发/独立**:`BridgeApp` 起一桥,两个 WS 客户端各发不同 `newgame`(绿:Forest+Llanowar / 红:Mountain+Grizzly Bears)——GREEN 只见 Forest,RED 只见 Mountain/Grizzly Bears,**零串场**,各自双回合推进。
+- **`DeckParser`**(独立):Arena 文本 20 Forest+4 Llanowar+4 Bears+2 Growth+Sideboard → main=30/side=3,假名跳过;AI 副本=30。
+- **胖包 `java -jar` BridgeApp**:监听可配 host/port;WS 连上收 lobby 帧→newgame→牌桌,手牌卡带中文/卡图。
+- 早前:全 res 默认牌组 game-over(~6383 步);最小 res(210M)可跑;中文/图独立验证;决策往返 `confirm`→false / `getChoices`→[C] / `input`→"7";`battle.html` JS `node --check` 通过。

@@ -70,9 +70,15 @@ public class WebGuiGame extends AbstractGuiGame {
     private volatile String okLabel = "OK", cancelLabel = "Cancel";
 
     // Serializes inbound actions off the WS thread and onto a dedicated worker,
-    // so engine callbacks never run on the network thread.
+    // so engine callbacks never run on the network thread. Daemon so a lingering
+    // session never keeps the JVM alive.
     private final ExecutorService inputExec =
-            Executors.newSingleThreadExecutor(r -> new Thread(r, "web-input"));
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "web-input");
+                t.setDaemon(true);
+                return t;
+            });
+    private volatile boolean stopped = false;
 
     // Monotonic id bumped whenever a fresh "your turn to act" prompt appears,
     // letting an auto-pilot client answer each prompt exactly once.
@@ -186,12 +192,37 @@ public class WebGuiGame extends AbstractGuiGame {
         return out;
     }
 
+    /**
+     * Tear down this session's match: detach the sink, unblock any parked decision,
+     * concede so the Forge game thread ends, then stop the input worker. Safe to call
+     * on WS close or when the connection starts a new game.
+     */
+    public void stop() {
+        if (stopped) return;
+        stopped = true;
+        sink = null;                 // no more sends to a closed connection
+        answerPendingDefault();      // unblock a parked awaitDecision
+        try {
+            final IGameController c = firstController();
+            inputExec.submit(() -> { try { if (c != null) c.concede(); } catch (Exception ignored) {} });
+        } catch (Exception ignored) {}
+        inputExec.shutdown();        // run the queued concede, then stop accepting work
+    }
+
+    public boolean isStopped() { return stopped; }
+
+    private IGameController firstController() {
+        IGameController c = getGameController(humanView);
+        return c != null ? c : getGameController();
+    }
+
     // ------------------------------------------------------------------
     // Inbound: browser action -> engine
     // ------------------------------------------------------------------
 
     /** Feed a browser action into the engine. Runs asynchronously on the input worker. */
     public void submitAction(final String id, final String cardId) {
+        if (stopped) return;
         inputExec.submit(() -> {
             try {
                 doAction(id, cardId);
@@ -728,10 +759,28 @@ public class WebGuiGame extends AbstractGuiGame {
     @Override
     public List<CardView> manipulateCardList(String title, Iterable<CardView> cards, Iterable<CardView> manipulable,
                                              boolean toTop, boolean toBottom, boolean toAnywhere) {
-        // [WEB-TODO] no dedicated reorder-to-top/bottom UI yet — keep the given order.
-        todo("manipulateCardList/" + title + " (default: unchanged)");
-        List<CardView> res = new ArrayList<>();
-        if (cards != null) for (CardView cv : cards) res.add(cv);
-        return res;
+        // Reorder the whole list via successive single picks (top -> bottom), reusing the
+        // "choose" panel. Default / timeout keeps the original order, so headless never blocks.
+        List<CardView> pool = new ArrayList<>();
+        if (cards != null) for (CardView cv : cards) pool.add(cv);
+        if (pool.size() <= 1) return pool;
+
+        List<CardView> ordered = new ArrayList<>();
+        int guard = pool.size() + 2;
+        while (!pool.isEmpty() && guard-- > 0) {
+            if (pool.size() == 1) { ordered.add(pool.remove(0)); break; }
+            Map<String, Object> d = baseDesc("choose",
+                    title == null ? "调整顺序" : title, "从上到下依次选择", 1, 1, false, false);
+            d.put("options", optsFrom(pool, null));
+            Answer a = awaitDecision(d);
+            if (a != null && a.picks() != null && a.picks().length > 0
+                    && a.picks()[0] >= 0 && a.picks()[0] < pool.size()) {
+                ordered.add(pool.remove(a.picks()[0]));
+            } else {
+                ordered.add(pool.remove(0)); // default / timeout: keep original order
+            }
+        }
+        ordered.addAll(pool);
+        return ordered;
     }
 }

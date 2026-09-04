@@ -19,19 +19,17 @@ import forge.localinstance.skin.ISkinImage;
  */
 public class WebGuiBase extends GuiDesktop {
 
-    private final WebGuiGame guiGame;
+    public WebGuiBase() {}
 
-    public WebGuiBase(WebGuiGame guiGame) {
-        this.guiGame = guiGame;
-    }
-
-    public WebGuiGame getWebGuiGame() {
-        return guiGame;
-    }
-
+    /**
+     * Each match uses its own {@link WebGuiGame} instance (passed explicitly to
+     * {@code HostedMatch.startMatch}), so this factory only needs to return a fresh
+     * throwaway for the rare engine paths that ask GuiBase for a new gui (e.g. a
+     * spectator with no local players). Per-connection games never rely on it.
+     */
     @Override
     public IGuiGame getNewGuiGame() {
-        return guiGame;
+        return new WebGuiGame();
     }
 
     /**

@@ -34,14 +34,13 @@ public final class BridgeApp {
                 System.getenv("MDC_WS_PORT"),
                 "8899"), 8899);
 
-        WebGuiGame gui = new WebGuiGame();
-        WebMatchServer server = new WebMatchServer(host, port, gui);
+        // Load the card DB once, up front, so the first connection doesn't pay for it.
+        MatchBootstrap.ensureInitialized();
+
+        WebMatchServer server = new WebMatchServer(host, port);
         server.start();
         System.out.println("[bridge] WebSocket bridge listening on ws://" + host + ":" + port);
-
-        // Boot the match; it runs on Forge's game thread and blocks for browser input.
-        MatchBootstrap.startHumanVsAi(gui);
-        System.out.println("[bridge] match started (human vs AI). Connect a browser to play.");
+        System.out.println("[bridge] each connection starts its own game via {\"id\":\"newgame\",\"deck\":...}");
 
         // Keep the JVM alive.
         Thread.currentThread().join();

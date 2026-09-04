@@ -11,23 +11,24 @@ import forge.gui.GuiBase;
 import forge.localinstance.properties.ForgePreferences.FPref;
 import forge.model.FModel;
 import forge.player.GamePlayerUtil;
+import forge.player.LobbyPlayerHuman;
 import forge.util.ThreadUtil;
 
 /**
- * Boots a headless Forge Constructed game: one human (driven by {@link WebGuiGame})
- * versus one Forge AI, with two simple mono-color decks written in code. This is the
- * shared entry used by both the WebSocket server ({@link BridgeApp}) and the offline
- * smoke test ({@link SmokeTest}).
+ * Global one-time setup (GuiBase + card DB) plus per-match bootstrap: one human
+ * (driven by a per-connection {@link WebGuiGame}) versus one Forge AI. Each call to
+ * {@link #startHumanVsAi} builds an independent {@link HostedMatch} on its own Forge
+ * game thread, so many connections can play concurrently.
  */
 public final class MatchBootstrap {
     private MatchBootstrap() {}
 
     private static volatile boolean initialized = false;
 
-    /** Install the headless GuiBase + load the card database. Idempotent. */
-    public static synchronized void ensureInitialized(WebGuiGame gui) {
+    /** Install the headless GuiBase + load the card database. Idempotent / global. */
+    public static synchronized void ensureInitialized() {
         if (!(GuiBase.getInterface() instanceof WebGuiBase)) {
-            GuiBase.setInterface(new WebGuiBase(gui));
+            GuiBase.setInterface(new WebGuiBase());
         }
         if (!initialized) {
             FModel.initialize(null, prefs -> {
@@ -40,37 +41,46 @@ public final class MatchBootstrap {
         }
     }
 
-    /**
-     * Build decks, wire the human to {@code gui}, and start the match. Returns
-     * immediately; the game runs on Forge's game thread and blocks for input
-     * that arrives via {@link WebGuiGame#submitAction}.
-     */
+    /** Default deck when a connection starts a game without providing a decklist. */
+    public static Deck defaultDeck() {
+        Deck d = new Deck("MDC Default");
+        d.getMain().add("Forest", 34);
+        d.getMain().add("Grizzly Bears", 26);
+        return d;
+    }
+
+    /** SmokeTest / no-deck entry: default human deck (AI mirrors it). */
     public static HostedMatch startHumanVsAi(WebGuiGame gui) {
-        ensureInitialized(gui);
+        return startHumanVsAi(gui, null);
+    }
 
-        Deck humanDeck = simpleDeck("MDC Human", "Forest", 34, "Grizzly Bears", 26);
-        Deck aiDeck = simpleDeck("MDC AI", "Mountain", 34, "Grizzly Bears", 26);
+    /**
+     * Start an independent human-vs-AI Constructed match. {@code humanDeck} null ->
+     * the default deck. The AI opponent plays a copy of the human deck (fair mirror).
+     * Returns immediately; the game runs on its own Forge game thread and blocks for
+     * input delivered via {@code gui.submitAction} / {@code gui.submitDecision}.
+     */
+    public static HostedMatch startHumanVsAi(WebGuiGame gui, Deck humanDeck) {
+        ensureInitialized();
 
-        RegisteredPlayer humanRp = new RegisteredPlayer(humanDeck);
-        humanRp.setPlayer(GamePlayerUtil.getGuiPlayer());
+        Deck human = humanDeck != null ? humanDeck : defaultDeck();
+        Deck ai = DeckParser.copyForAi(human);
 
-        RegisteredPlayer aiRp = new RegisteredPlayer(aiDeck);
+        RegisteredPlayer humanRp = new RegisteredPlayer(human);
+        // Fresh human LobbyPlayer per match (NOT the shared singleton) so concurrent
+        // matches don't alias the same player object.
+        humanRp.setPlayer(new LobbyPlayerHuman("You"));
+
+        RegisteredPlayer aiRp = new RegisteredPlayer(ai);
         aiRp.setPlayer(GamePlayerUtil.createAiPlayer());
 
         List<RegisteredPlayer> players = Arrays.asList(humanRp, aiRp);
 
         HostedMatch hosted = new HostedMatch();
-        // startMatch schedules the game on Forge's game thread (see GameAction.invoke)
-        // and returns; the WebGuiGame receives update callbacks from that thread.
+        // startMatch schedules the game on a Forge game thread (GameAction.invoke) and
+        // returns; the WebGuiGame receives update callbacks from that thread.
         hosted.startMatch(GameType.Constructed, null, players, humanRp, gui);
         return hosted;
-    }
-
-    static Deck simpleDeck(String name, String land, int nLand, String creature, int nCreature) {
-        Deck d = new Deck(name);
-        d.getMain().add(land, nLand);
-        d.getMain().add(creature, nCreature);
-        return d;
     }
 
     /** True if the calling code is running on Forge's dedicated game thread. */

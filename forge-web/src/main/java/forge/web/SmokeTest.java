@@ -51,8 +51,17 @@ public final class SmokeTest {
                 if (n % 20 == 0) System.out.println("[smoke] pushes=" + n);
             });
 
-            MatchBootstrap.startHumanVsAi(gui);
-            System.out.println("[smoke] match started; auto-passing priority...");
+            // Optional injected deck: -Dmdc.deck.file=<Arena decklist path>
+            forge.deck.Deck injected = null;
+            String deckFile = System.getProperty("mdc.deck.file");
+            if (deckFile != null && !deckFile.isBlank()) {
+                MatchBootstrap.ensureInitialized(); // card DB before parsing
+                String text = Files.readString(Paths.get(deckFile));
+                injected = DeckParser.parseArena("SmokeDeck", text);
+                System.out.println("[smoke] injected deck: " + (injected != null ? injected.getName() : "PARSE FAILED -> default"));
+            }
+            MatchBootstrap.startHumanVsAi(gui, injected);
+            System.out.println("[smoke] match started; auto-playing...");
 
             long deadline = System.currentTimeMillis() + 90_000; // 90s wall-clock cap
             int maxPushes = Integer.getInteger("mdc.smoke.maxPushes", 600); // keep artifact small
