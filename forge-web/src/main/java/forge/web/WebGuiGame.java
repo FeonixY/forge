@@ -1,14 +1,19 @@
 package forge.web;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 import forge.LobbyPlayer;
 import forge.deck.CardPool;
@@ -39,11 +44,17 @@ import forge.util.ITriggerEvent;
  * (pass priority / play / select), mirroring how RemoteClientGuiGame feeds the
  * engine from network messages.
  *
- * <p>Blocking decision methods (getChoices/confirm/assignCombatDamage/...) are
- * currently AUTO-STUBBED so a full headless game can run end to end. Each stub is
- * tagged {@code [WEB-TODO]} on stderr; wiring them to real browser prompts is the
- * next increment. Priority / attackers / blockers already flow through the Input
- * framework -> updateButtons/showPromptMessage/setSelectables -> submitAction.
+ * <p>Blocking dialog decisions (confirm/getChoices/chooseEntity/option/input/
+ * ability/amount) do a real browser round-trip: the game thread parks in
+ * {@link #awaitDecision} on a {@link CompletableFuture} after publishing a
+ * {@code decision} object in the pushed JSON; the WS thread (or the headless
+ * auto-pilot) completes the future via {@link #answerDecision} /
+ * {@link #answerPendingDefault}. A null completion means "use the caller's safe
+ * default", which keeps the headless SmokeTest able to finish a whole game.
+ * Priority / attackers / blockers flow separately through the Input framework
+ * (updateButtons/showPromptMessage/setSelectables -> submitAction). A few bulk
+ * decisions (assignCombatDamage/order/sideboard/manipulateCardList) keep improved
+ * default stubs, tagged {@code [WEB-TODO]}, and never block.
  */
 public class WebGuiGame extends AbstractGuiGame {
 
@@ -67,10 +78,32 @@ public class WebGuiGame extends AbstractGuiGame {
     // letting an auto-pilot client answer each prompt exactly once.
     private final AtomicInteger inputEpoch = new AtomicInteger();
 
+    // ---- dialog-decision round-trip state ----
+    /** Answer from the browser: chosen option indices and/or a raw value (number/text/CSV). */
+    public record Answer(int[] picks, String value) {}
+
+    private static final class Decision {
+        final long reqId;
+        final Map<String, Object> descriptor;
+        final CompletableFuture<Answer> future = new CompletableFuture<>();
+        Decision(long reqId, Map<String, Object> descriptor) {
+            this.reqId = reqId;
+            this.descriptor = descriptor;
+        }
+    }
+
+    private final AtomicLong reqSeq = new AtomicLong();
+    private volatile Decision pending;
+    /** 0 = wait forever (default, so a real human is never cut off). >0 = ms before falling back. */
+    private volatile long decisionTimeoutMs = 0;
+
     public void setSink(Sink s) { this.sink = s; pushState(); }
     public PlayerView getHumanView() { return humanView; }
     public boolean isOkEnabled() { return okEnabled; }
     public int getInputEpoch() { return inputEpoch.get(); }
+    public void setDecisionTimeoutMs(long ms) { this.decisionTimeoutMs = ms; }
+    public boolean hasPendingDecision() { return pending != null; }
+    public long pendingReqId() { Decision d = pending; return d == null ? -1 : d.reqId; }
 
     /** First currently-selectable card id (for auto-pilot / forced selections), or null. */
     public String firstSelectableCardId() {
@@ -85,7 +118,12 @@ public class WebGuiGame extends AbstractGuiGame {
     public String buildJson() {
         GameView gv = getGameView();
         PlayerView you = humanView != null ? humanView : getCurrentPlayer();
-        return GameViewSerializer.serialize(gv, you, promptText, buildActions());
+        Map<String, Object> root = GameViewSerializer.toMap(gv, you, promptText, buildActions());
+        Decision d = pending;
+        if (d != null) {
+            root.put("decision", d.descriptor);
+        }
+        return Json.write(root);
     }
 
     // Synchronized so pushes from the game thread and the input worker never
@@ -215,6 +253,116 @@ public class WebGuiGame extends AbstractGuiGame {
     }
 
     // ------------------------------------------------------------------
+    // Dialog-decision round-trip (game thread parks; WS/auto-pilot answers)
+    // ------------------------------------------------------------------
+
+    /**
+     * Publish a decision request and block the game thread until it is answered.
+     * IMPORTANT: {@code future.get()} is called with NO lock held, and the
+     * completing side ({@link #answerDecision}) takes no lock either, so there is
+     * no deadlock against the {@code synchronized pushState()}.
+     *
+     * @return the browser's {@link Answer}, or {@code null} if it timed out or was
+     *         answered with "use default" — the caller then applies a safe default.
+     */
+    private Answer awaitDecision(Map<String, Object> descriptor) {
+        long id = reqSeq.incrementAndGet();
+        descriptor.put("reqId", id);
+        Decision d = new Decision(id, descriptor);
+        pending = d;
+        pushState(); // browser now sees root.decision
+        Answer ans = null;
+        try {
+            long t = decisionTimeoutMs;
+            ans = (t > 0) ? d.future.get(t, TimeUnit.MILLISECONDS) : d.future.get();
+        } catch (Exception e) {
+            // timeout / interrupt -> caller default
+        } finally {
+            if (pending == d) pending = null;
+        }
+        pushState(); // clear the decision from the view
+        return ans;
+    }
+
+    /** Complete a pending decision from the browser. Safe from any thread. */
+    public void answerDecision(long reqId, int[] picks, String value) {
+        Decision d = pending;
+        if (d != null && d.reqId == reqId) {
+            d.future.complete(new Answer(picks, value));
+        }
+    }
+
+    /** Inbound {id:"decide"} entry from the WS server. */
+    public void submitDecision(long reqId, int[] picks, String value) {
+        answerDecision(reqId, picks, value);
+    }
+
+    /** Headless auto-pilot: answer the pending decision with the caller's default. */
+    public void answerPendingDefault() {
+        Decision d = pending;
+        if (d != null) {
+            d.future.complete(null); // null Answer -> each method falls back to its default
+        }
+    }
+
+    // ---- descriptor builders ----
+
+    private Map<String, Object> baseDesc(String type, String title, String prompt,
+                                         int min, int max, boolean optional, boolean numeric) {
+        Map<String, Object> d = new LinkedHashMap<>();
+        d.put("type", type);
+        d.put("title", title == null ? "" : title);
+        d.put("prompt", prompt == null ? "" : prompt);
+        d.put("min", min);
+        d.put("max", max);
+        d.put("optional", optional);
+        d.put("numeric", numeric);
+        return d;
+    }
+
+    private List<Map<String, Object>> optsFromStrings(List<String> items) {
+        List<Map<String, Object>> o = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("idx", i);
+            m.put("label", items.get(i) == null ? "" : items.get(i));
+            o.add(m);
+        }
+        return o;
+    }
+
+    private List<Map<String, Object>> optsFrom(List<?> items, Function<Object, String> label) {
+        List<Map<String, Object>> o = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            Object it = items.get(i);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("idx", i);
+            m.put("label", label != null ? label.apply(it) : labelFor(it));
+            if (it instanceof CardView cv) {
+                m.put("cardId", String.valueOf(cv.getId()));
+                m.put("img", ""); // same limitation as GameViewSerializer: no Scryfall id yet
+            }
+            o.add(m);
+        }
+        return o;
+    }
+
+    private String labelFor(Object o) {
+        if (o instanceof CardView cv) {
+            var s = cv.getCurrentState();
+            return s != null ? s.getName() : cv.getName();
+        }
+        if (o instanceof SpellAbilityView sa) {
+            String s = sa.getDescription();
+            return (s == null || s.isEmpty()) ? sa.toString() : s;
+        }
+        if (o instanceof GameEntityView g) {
+            return g.getName();
+        }
+        return String.valueOf(o);
+    }
+
+    // ------------------------------------------------------------------
     // IGuiGame / AbstractGuiGame overrides — state push
     // ------------------------------------------------------------------
 
@@ -326,73 +474,118 @@ public class WebGuiGame extends AbstractGuiGame {
     @Override public void restoreOldZones(PlayerView playerView, PlayerZoneUpdates playerZoneUpdates) {}
 
     // ------------------------------------------------------------------
-    // Blocking decisions — AUTO-STUBBED (see class doc). [WEB-TODO]
+    // Dialog decisions — real browser round-trip (default fallback keeps headless alive)
     // ------------------------------------------------------------------
 
     private static void todo(String what) {
-        System.err.println("[WEB-TODO] auto-answered decision: " + what);
+        System.err.println("[WEB-TODO] default-stubbed decision: " + what);
     }
 
     @Override
     public <T> List<T> getChoices(String message, int min, int max, List<T> choices,
                                   List<T> selected, FSerializableFunction<T, String> display) {
-        todo("getChoices/" + message);
         List<T> res = new ArrayList<>();
-        if (choices == null || choices.isEmpty() || max < 0) return res; // reveal-only or nothing
-        int want = Math.max(min, 0);
-        if (want == 0) want = Math.min(1, max <= 0 ? 0 : 1); // pick one when a single pick is allowed
-        for (int i = 0; i < choices.size() && res.size() < Math.max(want, min); i++) {
-            res.add(choices.get(i));
+        if (choices == null || choices.isEmpty() || max < 0) return res; // reveal-only or nothing to pick
+        Map<String, Object> d = baseDesc("choose", message, message, Math.max(min, 0), max, min <= 0, false);
+        final FSerializableFunction<T, String> disp = display;
+        d.put("options", optsFrom(choices, disp != null ? (Object o) -> {
+            try { @SuppressWarnings("unchecked") T t = (T) o; return disp.apply(t); }
+            catch (Exception e) { return labelFor(o); }
+        } : null));
+        Answer a = awaitDecision(d);
+        if (a != null && a.picks() != null) {
+            for (int idx : a.picks()) if (idx >= 0 && idx < choices.size()) res.add(choices.get(idx));
+            if (res.size() >= Math.max(min, 0)) return res;
         }
+        // default: first max(min,1) items
+        res.clear();
+        int want = Math.max(min, 0);
+        if (want == 0) want = Math.min(1, max);
+        for (int i = 0; i < choices.size() && res.size() < want; i++) res.add(choices.get(i));
         return res;
     }
 
     @Override
     public boolean confirm(CardView c, String question, boolean defaultIsYes, List<String> options) {
-        todo("confirm/" + question);
-        return defaultIsYes;
+        List<String> opts = (options == null || options.isEmpty()) ? Arrays.asList("是", "否") : options;
+        Map<String, Object> d = baseDesc("confirm", question, question, 1, 1, false, false);
+        d.put("options", optsFromStrings(opts));
+        Answer a = awaitDecision(d);
+        if (a == null || a.picks() == null || a.picks().length == 0) return defaultIsYes;
+        return a.picks()[0] == 0; // first option = affirmative
     }
 
     @Override
     public boolean showConfirmDialog(String message, String title, String yesButtonText,
                                      String noButtonText, boolean defaultYes) {
-        todo("confirmDialog/" + title);
-        return defaultYes;
+        Map<String, Object> d = baseDesc("confirm", title, message, 1, 1, false, false);
+        d.put("options", optsFromStrings(Arrays.asList(yesButtonText, noButtonText)));
+        Answer a = awaitDecision(d);
+        if (a == null || a.picks() == null || a.picks().length == 0) return defaultYes;
+        return a.picks()[0] == 0;
     }
 
     @Override
     public int showOptionDialog(String message, String title, FSkinProp icon,
                                 List<String> options, int defaultOption) {
-        todo("optionDialog/" + title);
-        return defaultOption;
+        if (options == null || options.isEmpty()) return defaultOption;
+        Map<String, Object> d = baseDesc("option", title, message, 1, 1, false, false);
+        d.put("options", optsFromStrings(options));
+        Answer a = awaitDecision(d);
+        if (a == null || a.picks() == null || a.picks().length == 0) return defaultOption;
+        int p = a.picks()[0];
+        return (p >= 0 && p < options.size()) ? p : defaultOption;
     }
 
     @Override
     public String showInputDialog(String message, String title, FSkinProp icon,
                                   String initialInput, List<String> inputOptions, boolean isNumeric) {
-        todo("inputDialog/" + title);
-        if (initialInput != null) return initialInput;
-        if (inputOptions != null && !inputOptions.isEmpty()) return inputOptions.get(0);
-        return isNumeric ? "0" : "";
+        Map<String, Object> d = baseDesc("input", title, message, 0, 0, false, isNumeric);
+        if (initialInput != null) d.put("value", initialInput);
+        if (inputOptions != null && !inputOptions.isEmpty()) d.put("options", optsFromStrings(inputOptions));
+        Answer a = awaitDecision(d);
+        if (a == null) {
+            if (initialInput != null) return initialInput;
+            if (inputOptions != null && !inputOptions.isEmpty()) return inputOptions.get(0);
+            return isNumeric ? "0" : "";
+        }
+        if (a.value() != null) return a.value();
+        if (a.picks() != null && a.picks().length > 0 && inputOptions != null
+                && a.picks()[0] >= 0 && a.picks()[0] < inputOptions.size()) {
+            return inputOptions.get(a.picks()[0]);
+        }
+        return initialInput != null ? initialInput : (isNumeric ? "0" : "");
     }
 
     @Override
     public GameEntityView chooseSingleEntityForEffect(String title, List<? extends GameEntityView> optionList,
                                                        DelayedReveal delayedReveal, boolean isOptional) {
-        todo("chooseSingleEntity/" + title);
-        if (isOptional || optionList == null || optionList.isEmpty()) return null;
-        return optionList.get(0);
+        if (optionList == null || optionList.isEmpty()) return null;
+        Map<String, Object> d = baseDesc("chooseEntity", title, title, isOptional ? 0 : 1, 1, isOptional, false);
+        d.put("options", optsFrom(new ArrayList<GameEntityView>(optionList), null));
+        Answer a = awaitDecision(d);
+        if (a != null && a.picks() != null && a.picks().length > 0) {
+            int idx = a.picks()[0];
+            if (idx >= 0 && idx < optionList.size()) return optionList.get(idx);
+            return null; // explicit "none" from an optional prompt
+        }
+        return isOptional ? null : optionList.get(0);
     }
 
     @Override
     public List<GameEntityView> chooseEntitiesForEffect(String title, List<? extends GameEntityView> optionList,
                                                         int min, int max, DelayedReveal delayedReveal) {
-        todo("chooseEntities/" + title);
         List<GameEntityView> res = new ArrayList<>();
-        if (optionList == null) return res;
-        for (int i = 0; i < optionList.size() && res.size() < Math.max(min, 0); i++) {
-            res.add(optionList.get(i));
+        if (optionList == null || optionList.isEmpty()) return res;
+        Map<String, Object> d = baseDesc("chooseEntities", title, title, Math.max(min, 0), max, min <= 0, false);
+        d.put("options", optsFrom(new ArrayList<GameEntityView>(optionList), null));
+        Answer a = awaitDecision(d);
+        if (a != null && a.picks() != null) {
+            for (int idx : a.picks()) if (idx >= 0 && idx < optionList.size()) res.add(optionList.get(idx));
+            if (res.size() >= Math.max(min, 0)) return res;
         }
+        res.clear();
+        for (int i = 0; i < optionList.size() && res.size() < Math.max(min, 0); i++) res.add(optionList.get(i));
         return res;
     }
 
@@ -400,7 +593,7 @@ public class WebGuiGame extends AbstractGuiGame {
     public Map<CardView, Integer> assignCombatDamage(CardView attacker, List<CardView> blockers,
                                                      int damage, GameEntityView defender,
                                                      boolean overrideOrder, boolean maySkip) {
-        todo("assignCombatDamage");
+        todo("assignCombatDamage (improved-default stub: all to first blocker)");
         Map<CardView, Integer> res = new LinkedHashMap<>();
         if (blockers != null && !blockers.isEmpty()) {
             res.put(blockers.get(0), damage); // dump all damage on the first blocker
@@ -411,11 +604,34 @@ public class WebGuiGame extends AbstractGuiGame {
     @Override
     public Map<Object, Integer> assignGenericAmount(CardView effectSource, Map<Object, Integer> target,
                                                     int amount, boolean atLeastOne, String amountLabel) {
-        todo("assignGenericAmount/" + amountLabel);
         Map<Object, Integer> res = new LinkedHashMap<>();
-        if (target != null && !target.isEmpty()) {
-            res.put(target.keySet().iterator().next(), amount);
+        if (target == null || target.isEmpty()) return res;
+        List<Object> keys = new ArrayList<>(target.keySet());
+        if (keys.size() == 1) { res.put(keys.get(0), amount); return res; }
+
+        Map<String, Object> d = baseDesc("amount", amountLabel == null ? "分配数量" : amountLabel,
+                "总计 " + amount, keys.size(), keys.size(), false, true);
+        d.put("amount", amount);
+        d.put("options", optsFrom(keys, null));
+        Answer a = awaitDecision(d);
+        if (a != null && a.value() != null) {
+            // value = CSV of amounts aligned to option idx
+            String[] parts = a.value().split(",");
+            if (parts.length == keys.size()) {
+                int[] vals = new int[keys.size()];
+                int sum = 0;
+                boolean ok = true;
+                for (int i = 0; i < parts.length && ok; i++) {
+                    try { vals[i] = Integer.parseInt(parts[i].trim()); sum += vals[i]; }
+                    catch (NumberFormatException e) { ok = false; }
+                }
+                if (ok && sum == amount) {
+                    for (int i = 0; i < keys.size(); i++) if (vals[i] > 0) res.put(keys.get(i), vals[i]);
+                    return res;
+                }
+            }
         }
+        res.put(keys.get(0), amount); // default: all on the first target
         return res;
     }
 
@@ -423,7 +639,15 @@ public class WebGuiGame extends AbstractGuiGame {
     public SpellAbilityView getAbilityToPlay(CardView hostCard, List<SpellAbilityView> abilities,
                                              ITriggerEvent triggerEvent) {
         if (abilities == null || abilities.isEmpty()) return null;
-        return abilities.get(0); // auto-pick the first ability of a played card
+        if (abilities.size() == 1) return abilities.get(0);
+        Map<String, Object> d = baseDesc("ability", "选择要使用的技能 / 模式", "", 1, 1, false, false);
+        d.put("options", optsFrom(abilities, null));
+        Answer a = awaitDecision(d);
+        if (a != null && a.picks() != null && a.picks().length > 0) {
+            int idx = a.picks()[0];
+            if (idx >= 0 && idx < abilities.size()) return abilities.get(idx);
+        }
+        return abilities.get(0);
     }
 
     @Override

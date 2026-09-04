@@ -67,6 +67,13 @@ public final class SmokeTest {
                     System.out.println("[smoke] reached maxPushes=" + maxPushes + " (still live); stopping.");
                     break;
                 }
+                // A blocking dialog decision parks the game thread — answer with the
+                // caller's default so the headless game keeps flowing to game-over.
+                if (gui.hasPendingDecision()) {
+                    gui.answerPendingDefault();
+                    Thread.sleep(20);
+                    continue;
+                }
                 int epoch = gui.getInputEpoch();
                 if (epoch != lastEpoch) {
                     lastEpoch = epoch;

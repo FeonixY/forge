@@ -107,24 +107,51 @@ mvn -q -pl forge-web -am exec:java -Dexec.mainClass=forge.web.BridgeApp
 
 ## 4. IGuiGame 决策方法接了哪些
 
-桥的核心:把引擎的阻塞式"问玩家"调用变成"推状态 + 等浏览器动作"。
+桥有**两条**把引擎阻塞调用变成浏览器往返的通路:
 
-**已接(经 Input 框架,真实可用)——优先权 / 攻击 / 阻挡:**
+### 4.1 优先权 / 攻击 / 阻挡 —— 经 Input 框架(action 协议)
 引擎在 `InputPassPriority/InputAttack/InputBlock` 里通过
 `showPromptMessage` + `updateButtons` + `setSelectables` 呈现提示,
-浏览器回传后由 `WebGuiGame.submitAction(id,cardId)` 映射到 `IGameController`:
+体现在推送 JSON 的 `actions[]` 里;浏览器回传 `{id,cardId}`,由
+`WebGuiGame.submitAction(id,cardId)` 映射到 `IGameController`:
 - `pass`/`ok` → `selectButtonOk()`(过优先权 / 确认攻防)
 - `cancel`/`endturn` → `selectButtonCancel()`
 - `play`/`select` + cardId → `selectCard(cardView,null,null)`(使用牌 / 选卡 / 宣告攻击者 / 选阻挡)
 - `concede` → `concede()`
 
-**暂为自动桩(`[WEB-TODO]`,让整局能无头跑通,尚未接浏览器)——其余弹窗式决策:**
-`getChoices` / `confirm` / `showConfirmDialog` / `showOptionDialog` / `showInputDialog` /
-`chooseSingleEntityForEffect` / `chooseEntitiesForEffect` / `assignCombatDamage` /
-`assignGenericAmount` / `getAbilityToPlay` / `order` / `sideboard` / `manipulateCardList`。
-每次触发都会在 stderr 打 `[WEB-TODO] ...`,便于按需逐个接成真实浏览器提示。
+### 4.2 弹窗式决策 —— 真正的浏览器往返(decision / decide 协议)
+游戏线程在决策方法里调用 `awaitDecision(descriptor)`:先把一个 `decision` 对象塞进推送 JSON,
+然后阻塞在一个 `CompletableFuture` 上;浏览器(或无头自动应答)回传 `{id:"decide",...}`,
+`WebGuiGame.answerDecision(reqId,picks,value)` 完成 future,方法把 picks/value 映射回真正的
+Java 对象返回。**线程/死锁**:`future.get()` 不在任何锁内调用,完成方也不持锁,`pushState()` 的
+`synchronized` 与之无交叉,故无死锁。
 
-启动时的"是否调度手牌(mulligan)"走 `confirm`,桩返回 `defaultIsYes`=保留,故不会 mulligan、不触发 London 置底。
+**已接成真实往返的方法**(每个都有"answer==null → 安全默认"兜底,保证无头能跑):
+`confirm`、`showConfirmDialog`、`showOptionDialog`、`showInputDialog`、`getChoices`
+(覆盖 `one/oneOrNone/many`)、`chooseSingleEntityForEffect`、`chooseEntitiesForEffect`、
+`getAbilityToPlay`(选模式/技能,label 取 `SpellAbilityView.getDescription()`)、
+`assignGenericAmount`(多目标分配数量,value=各目标数量的 CSV)。
+
+**决策帧协议**(推送 JSON 里的 `decision`):
+```
+decision: { reqId, type, title, prompt, min, max, optional, numeric,
+            amount?,                       // 仅 type=="amount"
+            value?,                        // 仅 type=="input" 的初值
+            options:[{ idx, label, cardId?, img? }] }   // 卡类选项带 cardId/img
+```
+`type` ∈ `confirm | option | ability | input | amount | choose | chooseEntity | chooseEntities`。
+浏览器回传:`{ id:"decide", reqId, picks:[idx...], value:"..." }`(picks 是 options 的 idx 数组;
+value 用于 input 的文本/数字与 amount 的 CSV)。
+
+**超时兜底**:`awaitDecision` 默认**无限等待**(不打断真人);`WebGuiGame.setDecisionTimeoutMs(ms)`
+可设一个较长超时,超时后走安全默认。
+
+**仍为改进版默认桩(`[WEB-TODO]`,绝不阻塞无头)**:`assignCombatDamage`(全部塞给第一个阻挡者)、
+`order`、`sideboard`、`manipulateCardList`。这些需要更专门的 UI,留待后续。
+
+**无头 SmokeTest**:自动驾驶检测到 `hasPendingDecision()` 就 `answerPendingDefault()`(用 null 完成
+future → 各方法走默认),因此**整局能跑到自然 game-over**。启动时的 mulligan/coin-toss 走 Input 框架
+(action 协议)由自动过优先权处理。
 
 ---
 
@@ -134,10 +161,10 @@ mvn -q -pl forge-web -am exec:java -Dexec.mainClass=forge.web.BridgeApp
 |---|---|
 | `GameViewSerializer` | GameView → 契约 JSON(纯函数) |
 | `Json` | 极简 JSON 写出(无第三方依赖) |
-| `WebGuiGame extends AbstractGuiGame` | IGuiGame 实现:状态推送 + `submitAction` 回喂 + 决策桩 |
+| `WebGuiGame extends AbstractGuiGame` | IGuiGame 实现:状态推送 + `submitAction`(action)回喂 + `awaitDecision/answerDecision`(decision 往返) |
 | `WebGuiBase extends GuiDesktop` | 无头 GuiBase;`getNewGuiGame()` 返回共享的 WebGuiGame |
 | `MatchBootstrap` | 装 GuiBase、`FModel.initialize`、造两副牌、`HostedMatch.startMatch(...)` |
-| `WebMatchServer` | org.java_websocket 服务:广播状态 / 解析回传动作 |
+| `WebMatchServer` | org.java_websocket 服务:广播状态 / 解析 action 与 decide 回传 |
 | `BridgeApp` | main:起 WS + 开局 |
 | `SmokeTest` | main:自动过优先权 + 落盘每步 JSON |
 
@@ -146,25 +173,33 @@ mvn -q -pl forge-web -am exec:java -Dexec.mainClass=forge.web.BridgeApp
 
 ---
 
-## 6. 已知缺口 / 下一步
+## 6. 前端对接(已接)
 
-1. **卡图 + 中文名(最大缺口)**:引擎按"英文名 + set + 收集编号"标识卡,**没有 Scryfall id、没有中文名**。
-   battle.html 的图 URL(`images.mtgch.com/.../{scryfallId}...`)需要 Scryfall id。
-   现状:`img:""`、`zh:""`、`id`=Forge 内部 id(仅作 key)。
-   待补:在桥外用 (setCode, collectorNumber) 或英文名去查 MDC `set_cards` 表,解析出 Scryfall id 与中文名后回填 `id/zh/img`。
-   `CardStateView.getSetCode()` 可拿 set;收集编号需从 `PaperCard` 侧取(序列化器已注释 TODO 位置)。
-2. **弹窗式决策接浏览器**:把 §4 的 `[WEB-TODO]` 桩逐个改成"推一个决策请求 + 阻塞在 per-request future,浏览器答复后 resume"。
-   建议给契约加一个 `decision` 帧类型(choices/confirm/assignDamage 等),前端弹层选择。
-3. **actions 精确化**:目前"可出的牌"依赖 `setSelectables`。优先权空闲态下 Forge 会不会把可打的牌塞进 selectables 需再核实;
-   必要时改为直接查引擎的可用 SpellAbility 列表来生成 `play` 动作。
-4. **前端对接**:`battle.html` 现为 `fetch(mock_gameview.json)`。改造:`new WebSocket("ws://host:8899")`,
-   `onmessage` → `render(JSON.parse(e.data))`;把按钮 `onclick` 从 alert 改成 `ws.send(JSON.stringify({id,cardId}))`。
-5. **打包上线**:加 maven-shade/assembly 出胖 jar;服务端需带 `forge-gui/res` 卡库数据。
+`MagicDraftCommunity/mdc-web/battle.html` 已改成 WebSocket 数据源:
+- `connect()` → `ws://<location.hostname>:8899`(端口可用 `window.MDC_WS_PORT` 覆盖);
+  `onmessage` → `render(JSON.parse(...))`;断线 2s 自动重连;**连不上 1.5s 内回退 `fetch(mock_gameview.json)`**(离线仍可看)。
+- `actions[]`(pass/play/select)按钮点击 → `send({id,cardId})`。
+- 当帧带 `decision` 时弹**决策面板** `renderDecision(dec)`:confirm/option/ability=按钮;input=输入框;
+  choose/chooseEntity/chooseEntities=可多选(卡类选项显示卡图,带 min/max 校验);amount=各目标数字框(校验和=amount)。
+  选完 `send({id:"decide",reqId,picks,value})`。
 
 ---
 
-## 7. 验证记录
+## 7. 已知缺口 / 下一步
 
-- `mvn -pl forge-game,forge-ai -am compile`:通过(headless 引擎可编译)。
-- `mvn -pl forge-web -am compile`:见提交时状态。
-- `SmokeTest`:见 `smoke_gameview.jsonl` / `smoke_first.json` 产物。
+1. **卡图 + 中文名(最大缺口)**:引擎按"英文名 + set + 收集编号"标识卡,**没有 Scryfall id、没有中文名**。
+   现状:`img:""`、`zh:""`、`id`=Forge 内部 id(仅作 key)。待补:桥外用 (setCode, collectorNumber)/英文名查 MDC `set_cards` 表回填。
+2. **仍为默认桩的决策**:`assignCombatDamage`(全塞第一个阻挡者)、`order`、`sideboard`、`manipulateCardList`——需专门 UI,后续接。
+3. **actions 精确化**:优先权空闲态下"可出的牌"依赖 `setSelectables`,实测未必含地牌;可改为直接查引擎可用 SpellAbility 生成 `play`。
+4. **打包上线**:加 maven-shade/assembly 出胖 jar;服务端需带 `forge-gui/res` 卡库数据。
+
+---
+
+## 8. 验证记录
+
+- `mvn -pl forge-game,forge-ai -am compile`:通过。
+- `mvn -pl forge-web -am compile`:通过。
+- `SmokeTest`(带决策框架):跑到**自然 game-over**(~6388 步),JSONL 逐行合法。
+- **决策往返**(独立测试):`confirm`(选"否")→false、`getChoices`(选 idx2)→[C]、`showInputDialog`→"7",均正确;`decision` 帧形状符合协议。
+- **实时 WS**:`BridgeApp` 起服务,WS 客户端连上收到 400 帧、双方回合、全阶段;`action`(pass/select)推进引擎;`decide` 消息可解析。
+- `battle.html` JS:`node --check` 通过。

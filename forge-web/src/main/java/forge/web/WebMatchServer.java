@@ -1,6 +1,7 @@
 package forge.web;
 
 import java.net.InetSocketAddress;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,11 +61,48 @@ public class WebMatchServer extends WebSocketServer implements WebGuiGame.Sink {
     @Override
     public void onMessage(WebSocket conn, String message) {
         String id = extract(message, "id");
+        if ("decide".equals(id)) {
+            String reqStr = extract(message, "reqId");
+            long reqId = reqStr == null ? -1 : safeLong(reqStr);
+            int[] picks = extractIntArray(message, "picks");
+            String value = extract(message, "value");
+            System.out.println("[ws] decide: reqId=" + reqId + " picks=" + Arrays.toString(picks)
+                    + " value=" + value);
+            if (reqId >= 0) gui.submitDecision(reqId, picks, value);
+            return;
+        }
         String cardId = extract(message, "cardId");
         System.out.println("[ws] action: id=" + id + " cardId=" + cardId);
         if (id != null) {
             gui.submitAction(id, cardId);
         }
+    }
+
+    private static long safeLong(String s) {
+        try { return Long.parseLong(s.trim()); } catch (Exception e) { return -1; }
+    }
+
+    /** Parse a top-level JSON int array like {"picks":[0,2,3]}. Returns empty array if absent. */
+    static int[] extractIntArray(String json, String key) {
+        if (json == null) return new int[0];
+        String needle = "\"" + key + "\"";
+        int k = json.indexOf(needle);
+        if (k < 0) return new int[0];
+        int lb = json.indexOf('[', k);
+        int rb = lb < 0 ? -1 : json.indexOf(']', lb);
+        if (lb < 0 || rb < 0) return new int[0];
+        String body = json.substring(lb + 1, rb).trim();
+        if (body.isEmpty()) return new int[0];
+        String[] parts = body.split(",");
+        java.util.List<Integer> vals = new java.util.ArrayList<>();
+        for (String p : parts) {
+            p = p.trim();
+            if (p.isEmpty()) continue;
+            try { vals.add(Integer.parseInt(p)); } catch (NumberFormatException ignored) {}
+        }
+        int[] out = new int[vals.size()];
+        for (int i = 0; i < out.length; i++) out[i] = vals.get(i);
+        return out;
     }
 
     @Override
