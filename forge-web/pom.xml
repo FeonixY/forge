@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <artifactId>forge</artifactId>
+        <groupId>forge</groupId>
+        <version>${revision}</version>
+    </parent>
+
+    <artifactId>forge-web</artifactId>
+    <name>Forge Web Bridge (MDC)</name>
+    <description>
+        WebSocket bridge that runs a headless Forge game (1 human driven from a
+        browser + 1 Forge AI) and streams a GameView JSON contract to the browser,
+        feeding browser actions back into the engine. Built for MagicDraftCommunity.
+    </description>
+
+    <dependencies>
+        <!-- Brings forge-gui, forge-game, forge-ai, forge-core transitively,
+             plus GuiDesktop which we subclass for a headless IGuiBase. -->
+        <dependency>
+            <groupId>forge</groupId>
+            <artifactId>forge-gui-desktop</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+
+        <!-- Lightweight WebSocket server. -->
+        <dependency>
+            <groupId>org.java-websocket</groupId>
+            <artifactId>Java-WebSocket</artifactId>
+            <version>1.5.7</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <source>17</source>
+                    <target>17</target>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

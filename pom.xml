@@ -69,6 +69,7 @@
         <module>forge-gui-mobile</module>
         <module>forge-gui-mobile-dev</module>
         <module>forge-gui-desktop</module>
+        <module>forge-web</module>
         <module>forge-lda</module>
         <module>adventure-editor</module>
         <module>forge-gui-android</module>
