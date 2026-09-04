@@ -125,10 +125,12 @@ public final class GameViewSerializer {
         Map<String, Object> ref = new LinkedHashMap<>();
         CardStateView st = cv.getCurrentState();
 
-        ref.put("id", String.valueOf(cv.getId()));
         String name = st != null ? st.getName() : cv.getName();
+        // Resolve Scryfall id + Chinese name + mtgch image URLs from the bundled index.
+        CardImage img = resolveImage(name, cv.getId());
+        ref.put("id", img.id);
         ref.put("name", name == null || name.isEmpty() ? "???" : name);
-        ref.put("zh", ""); // TODO: no Chinese name in engine; resolve via MDC set_cards.
+        ref.put("zh", img.zh);
         ref.put("tapped", cv.isTapped());
 
         List<Object> types = new ArrayList<>();
@@ -162,8 +164,42 @@ public final class GameViewSerializer {
         }
         ref.put("counters", counters);
 
-        ref.put("img", ""); // TODO: needs Scryfall id (see class doc).
+        ref.put("img", img.img);       // zhs (Chinese art) first
+        ref.put("imgen", img.imgen);   // sf (English) fallback for the browser's onerror
         return ref;
+    }
+
+    // ---- image / id / zh resolution (shared with decision options) ----
+
+    /** Resolved identity for a card: Scryfall id (or Forge id fallback), zh name, image URLs. */
+    public static final class CardImage {
+        public final String id, zh, img, imgen;
+        CardImage(String id, String zh, String img, String imgen) {
+            this.id = id; this.zh = zh; this.img = img; this.imgen = imgen;
+        }
+    }
+
+    /**
+     * Look up {@code englishName} in the bundled index. On a hit: id = Scryfall id,
+     * zh = Chinese name, img/imgen = mtgch zhs/sf URLs. On a miss: id = the Forge
+     * card id (as a stable key), zh/img/imgen empty.
+     */
+    public static CardImage resolveImage(String englishName, int forgeId) {
+        CardIndex.Entry e = CardIndex.lookup(englishName);
+        String scry = (e != null && e.id() != null && !e.id().isBlank()) ? e.id() : null;
+        String id = scry != null ? scry : String.valueOf(forgeId);
+        String zh = e != null ? e.zh() : "";
+        String imgZhs = "", imgSf = "";
+        if (scry != null && scry.length() >= 2) {
+            imgZhs = mtgch("zhs", scry);
+            imgSf = mtgch("sf", scry);
+        }
+        return new CardImage(id, zh, imgZhs, imgSf);
+    }
+
+    private static String mtgch(String lang, String scryId) {
+        return "https://images.mtgch.com/" + lang + "/normal/front/"
+                + scryId.charAt(0) + "/" + scryId.charAt(1) + "/" + scryId + ".webp";
     }
 
     // ---- helpers ----

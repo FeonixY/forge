@@ -1,15 +1,155 @@
 package forge.web;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Minimal, dependency-free JSON writer. Just enough to emit the GameView contract
- * (objects, arrays, strings, numbers, booleans). Kept deliberately tiny so the
- * bridge pulls in no JSON library.
+ * Minimal, dependency-free JSON writer + reader. The writer emits the GameView
+ * contract (objects, arrays, strings, numbers, booleans); the reader parses a
+ * standard JSON document into Map / List / String / Double / Boolean / null.
+ * Kept deliberately tiny so the bridge pulls in no JSON library.
  */
 public final class Json {
     private Json() {}
+
+    // ------------------------------------------------------------------
+    // Reader: parse a JSON document into Java objects.
+    // Object -> LinkedHashMap<String,Object>, Array -> ArrayList<Object>,
+    // String -> String, Number -> Double, true/false -> Boolean, null -> null.
+    // ------------------------------------------------------------------
+
+    public static Object parse(String s) {
+        Parser p = new Parser(s);
+        p.skipWs();
+        Object v = p.readValue();
+        p.skipWs();
+        if (!p.eof()) throw new IllegalArgumentException("Trailing data at " + p.pos);
+        return v;
+    }
+
+    private static final class Parser {
+        final String s;
+        int pos;
+        Parser(String s) { this.s = s; }
+
+        boolean eof() { return pos >= s.length(); }
+        char peek() { return s.charAt(pos); }
+
+        void skipWs() {
+            while (pos < s.length()) {
+                char c = s.charAt(pos);
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') pos++;
+                else break;
+            }
+        }
+
+        Object readValue() {
+            char c = peek();
+            switch (c) {
+                case '{': return readObject();
+                case '[': return readArray();
+                case '"': return readString();
+                case 't': expect("true"); return Boolean.TRUE;
+                case 'f': expect("false"); return Boolean.FALSE;
+                case 'n': expect("null"); return null;
+                default:  return readNumber();
+            }
+        }
+
+        Map<String, Object> readObject() {
+            Map<String, Object> m = new LinkedHashMap<>();
+            pos++; // {
+            skipWs();
+            if (!eof() && peek() == '}') { pos++; return m; }
+            while (true) {
+                skipWs();
+                String key = readString();
+                skipWs();
+                if (peek() != ':') throw err("':' expected");
+                pos++;
+                skipWs();
+                m.put(key, readValue());
+                skipWs();
+                char c = peek();
+                if (c == ',') { pos++; continue; }
+                if (c == '}') { pos++; break; }
+                throw err("',' or '}' expected");
+            }
+            return m;
+        }
+
+        List<Object> readArray() {
+            List<Object> a = new ArrayList<>();
+            pos++; // [
+            skipWs();
+            if (!eof() && peek() == ']') { pos++; return a; }
+            while (true) {
+                skipWs();
+                a.add(readValue());
+                skipWs();
+                char c = peek();
+                if (c == ',') { pos++; continue; }
+                if (c == ']') { pos++; break; }
+                throw err("',' or ']' expected");
+            }
+            return a;
+        }
+
+        String readString() {
+            if (peek() != '"') throw err("'\"' expected");
+            pos++;
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                if (eof()) throw err("unterminated string");
+                char c = s.charAt(pos++);
+                if (c == '"') break;
+                if (c == '\\') {
+                    char e = s.charAt(pos++);
+                    switch (e) {
+                        case '"':  sb.append('"');  break;
+                        case '\\': sb.append('\\'); break;
+                        case '/':  sb.append('/');  break;
+                        case 'b':  sb.append('\b'); break;
+                        case 'f':  sb.append('\f'); break;
+                        case 'n':  sb.append('\n'); break;
+                        case 'r':  sb.append('\r'); break;
+                        case 't':  sb.append('\t'); break;
+                        case 'u':
+                            sb.append((char) Integer.parseInt(s.substring(pos, pos + 4), 16));
+                            pos += 4;
+                            break;
+                        default: throw err("bad escape \\" + e);
+                    }
+                } else {
+                    sb.append(c);
+                }
+            }
+            return sb.toString();
+        }
+
+        Object readNumber() {
+            int start = pos;
+            while (pos < s.length()) {
+                char c = s.charAt(pos);
+                if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') pos++;
+                else break;
+            }
+            String num = s.substring(start, pos);
+            if (num.isEmpty()) throw err("value expected");
+            return Double.valueOf(num);
+        }
+
+        void expect(String lit) {
+            if (!s.startsWith(lit, pos)) throw err("'" + lit + "' expected");
+            pos += lit.length();
+        }
+
+        IllegalArgumentException err(String msg) {
+            return new IllegalArgumentException("JSON parse error at " + pos + ": " + msg);
+        }
+    }
 
     /** Serialize a value (Map, List, String, Number, Boolean, null) to a JSON string. */
     public static String write(Object value) {

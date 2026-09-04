@@ -26,7 +26,11 @@ public class WebMatchServer extends WebSocketServer implements WebGuiGame.Sink {
     private volatile String lastJson = null;
 
     public WebMatchServer(int port, WebGuiGame gui) {
-        super(new InetSocketAddress(port));
+        this("127.0.0.1", port, gui);
+    }
+
+    public WebMatchServer(String host, int port, WebGuiGame gui) {
+        super(new InetSocketAddress(host, port));
         this.gui = gui;
         gui.setSink(this);
         setReuseAddr(true);

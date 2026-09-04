@@ -339,8 +339,12 @@ public class WebGuiGame extends AbstractGuiGame {
             m.put("idx", i);
             m.put("label", label != null ? label.apply(it) : labelFor(it));
             if (it instanceof CardView cv) {
-                m.put("cardId", String.valueOf(cv.getId()));
-                m.put("img", ""); // same limitation as GameViewSerializer: no Scryfall id yet
+                var s = cv.getCurrentState();
+                String en = s != null ? s.getName() : cv.getName();
+                GameViewSerializer.CardImage ci = GameViewSerializer.resolveImage(en, cv.getId());
+                m.put("cardId", ci.id);   // Scryfall id (or Forge id) — cosmetic; picks are by idx
+                m.put("img", ci.img);
+                m.put("imgen", ci.imgen);
             }
             o.add(m);
         }
@@ -593,11 +597,35 @@ public class WebGuiGame extends AbstractGuiGame {
     public Map<CardView, Integer> assignCombatDamage(CardView attacker, List<CardView> blockers,
                                                      int damage, GameEntityView defender,
                                                      boolean overrideOrder, boolean maySkip) {
-        todo("assignCombatDamage (improved-default stub: all to first blocker)");
         Map<CardView, Integer> res = new LinkedHashMap<>();
-        if (blockers != null && !blockers.isEmpty()) {
-            res.put(blockers.get(0), damage); // dump all damage on the first blocker
+        if (blockers == null || blockers.isEmpty()) return res;
+        if (blockers.size() == 1) { res.put(blockers.get(0), damage); return res; }
+
+        // amount-per-blocker decision: distribute `damage` across the blockers.
+        String atk = attacker != null && attacker.getCurrentState() != null
+                ? attacker.getCurrentState().getName() : "攻击者";
+        Map<String, Object> d = baseDesc("amount", "分配战斗伤害",
+                atk + " 造成 " + damage + " 点伤害，分配给阻挡者", blockers.size(), blockers.size(), false, true);
+        d.put("amount", damage);
+        d.put("options", optsFrom(new ArrayList<CardView>(blockers), null));
+        Answer a = awaitDecision(d);
+        if (a != null && a.value() != null) {
+            String[] parts = a.value().split(",");
+            if (parts.length == blockers.size()) {
+                int[] vals = new int[blockers.size()];
+                int sum = 0;
+                boolean ok = true;
+                for (int i = 0; i < parts.length && ok; i++) {
+                    try { vals[i] = Integer.parseInt(parts[i].trim()); sum += vals[i]; }
+                    catch (NumberFormatException e) { ok = false; }
+                }
+                if (ok && sum == damage) {
+                    for (int i = 0; i < blockers.size(); i++) if (vals[i] > 0) res.put(blockers.get(i), vals[i]);
+                    return res;
+                }
+            }
         }
+        res.put(blockers.get(0), damage); // default: all on the first blocker
         return res;
     }
 
@@ -654,23 +682,54 @@ public class WebGuiGame extends AbstractGuiGame {
     public <T> OrderResult<T> order(String title, String top, int remainingObjectsMin, int remainingObjectsMax,
                                     List<T> sourceChoices, List<T> destChoices, CardView referenceCard,
                                     boolean sideboardingMode, boolean showRememberCheckbox) {
-        todo("order/" + title);
         List<T> ordered = new ArrayList<>();
         if (destChoices != null) ordered.addAll(destChoices);
-        if (sourceChoices != null) ordered.addAll(sourceChoices);
+        if (sourceChoices == null || sourceChoices.isEmpty()) {
+            return new OrderResult<>(ordered, false);
+        }
+        List<T> pool = new ArrayList<>(sourceChoices);
+        int remMin = Math.max(0, remainingObjectsMin);
+        int remMax = remainingObjectsMax < 0 ? 0 : remainingObjectsMax;
+        if (remMax < remMin) remMax = remMin;
+
+        // Order by successive single picks (top -> bottom). Each pick is a "choose"
+        // decision (max 1). Stop once the number of leftovers is within [remMin, remMax].
+        int guard = pool.size() + 2;
+        while (pool.size() > remMin && guard-- > 0) {
+            boolean mustPick = pool.size() > remMax; // too many remain -> a pick is required
+            Map<String, Object> d = baseDesc("choose",
+                    title == null ? "排序" : title,
+                    (top == null ? "" : top) + "（从上到下依次选择）",
+                    mustPick ? 1 : 0, 1, !mustPick, false);
+            d.put("options", optsFrom(pool, null));
+            Answer a = awaitDecision(d);
+            if (a != null && a.picks() != null && a.picks().length > 0) {
+                int idx = a.picks()[0];
+                if (idx >= 0 && idx < pool.size()) { ordered.add(pool.remove(idx)); continue; }
+            }
+            if (a != null && a.picks() != null && a.picks().length == 0 && !mustPick) {
+                break; // user stopped; leftovers stay unselected
+            }
+            // default / timeout: take the top if a pick is required, else stop
+            if (mustPick) ordered.add(pool.remove(0));
+            else break;
+        }
         return new OrderResult<>(ordered, false);
     }
 
     @Override
     public List<PaperCard> sideboard(CardPool sideboard, CardPool main, String message) {
-        todo("sideboard");
-        return null; // keep current deck
+        // [WEB-TODO] no sideboard UI yet — keep the current deck (never blocks; only
+        // relevant between games of a match).
+        todo("sideboard (default: keep deck)");
+        return null;
     }
 
     @Override
     public List<CardView> manipulateCardList(String title, Iterable<CardView> cards, Iterable<CardView> manipulable,
                                              boolean toTop, boolean toBottom, boolean toAnywhere) {
-        todo("manipulateCardList/" + title);
+        // [WEB-TODO] no dedicated reorder-to-top/bottom UI yet — keep the given order.
+        todo("manipulateCardList/" + title + " (default: unchanged)");
         List<CardView> res = new ArrayList<>();
         if (cards != null) for (CardView cv : cards) res.add(cv);
         return res;
