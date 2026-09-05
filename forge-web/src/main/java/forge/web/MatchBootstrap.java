@@ -35,6 +35,9 @@ public final class MatchBootstrap {
                 prefs.setPref(FPref.LOAD_CARD_SCRIPTS_LAZILY, false);
                 prefs.setPref(FPref.UI_LANGUAGE, "en-US");
                 prefs.setPref(FPref.ENFORCE_DECK_LEGALITY, false);
+                // Best-of-3 so between-games sideboarding actually triggers (also the Forge
+                // default, but pin it explicitly). HostedMatch reads this pref for gamesPerMatch.
+                prefs.setPref(FPref.UI_MATCHES_PER_GAME, "3");
                 return null;
             });
             initialized = true;

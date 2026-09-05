@@ -107,6 +107,12 @@ public class WebGuiGame extends AbstractGuiGame {
     /** 0 = wait forever (default, so a real human is never cut off). >0 = ms before falling back. */
     private volatile long decisionTimeoutMs = 0;
 
+    // ---- between-games sideboard round-trip (no GameView; own frame) ----
+    /** Non-null while a sideboard prompt is outstanding; pushState re-sends it verbatim. */
+    private volatile String sideboardFrame;
+    private volatile long sideboardReqId = -1;
+    private volatile CompletableFuture<int[]> sideboardFuture;
+
     public void setSink(Sink s) { this.sink = s; pushState(); }
     public PlayerView getHumanView() { return humanView; }
     public boolean isOkEnabled() { return okEnabled; }
@@ -142,7 +148,11 @@ public class WebGuiGame extends AbstractGuiGame {
         Sink s = sink;
         if (s == null) return;
         try {
-            s.onState(buildJson());
+            // While a sideboard prompt is outstanding there is no live GameView to
+            // serialize; keep re-sending the sideboard frame so any stray push (or a
+            // reconnect) still shows the sideboard screen rather than a blank board.
+            String sb = sideboardFrame;
+            s.onState(sb != null ? sb : buildJson());
         } catch (Exception e) {
             System.err.println("[WebGuiGame] push failed: " + e);
         }
@@ -236,6 +246,8 @@ public class WebGuiGame extends AbstractGuiGame {
         stopped = true;
         sink = null;                 // no more sends to a closed connection
         answerPendingDefault();      // unblock a parked awaitDecision
+        CompletableFuture<int[]> sf = sideboardFuture; // unblock a parked sideboard()
+        if (sf != null) sf.complete(null);
         try {
             final IGameController c = firstController();
             inputExec.submit(() -> { try { if (c != null) c.concede(); } catch (Exception ignored) {} });
@@ -357,7 +369,22 @@ public class WebGuiGame extends AbstractGuiGame {
             case "play": case "select": {
                 CardView cv = cardId == null ? null : findCard(Integer.parseInt(cardId));
                 if (cv != null) {
-                    boolean ok = ctrl.selectCard(cv, null, null);
+                    // Retry: selectCard fails when the target Input isn't the active one yet
+                    // (Forge registers InputPassPriority / InputAttack / InputBlock on the EDT
+                    // a beat after it publishes "you have priority", so a select that arrives in
+                    // that window hits a stale/absent input and returns false — this is exactly
+                    // why casting looked broken: land drops sometimes flapped and creature casts
+                    // never started). Poll briefly until the input is ready; a genuinely illegal
+                    // action simply stays false through all attempts and costs only a few ms.
+                    boolean ok = false;
+                    for (int attempt = 0; attempt < 12 && !ok && !stopped; attempt++) {
+                        ok = ctrl.selectCard(cv, null, null);
+                        if (ok) break;
+                        try { Thread.sleep(40); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+                        // refresh the CardView each retry (the tracker may replace it across a state push)
+                        CardView cv2 = findCard(Integer.parseInt(cardId));
+                        if (cv2 != null) cv = cv2;
+                    }
                     System.out.println("[WebGuiGame] select id=" + cardId + " name="
                             + (cv.getCurrentState()!=null?cv.getCurrentState().getName():cv.getName())
                             + " -> selectCard=" + ok);
@@ -533,6 +560,13 @@ public class WebGuiGame extends AbstractGuiGame {
         pushState();
     }
 
+    // Localized "Auto" label — InputPayMana is the ONLY input that puts it on the OK
+    // button (enable1), and only when a legal auto-payment exists. We use that as the
+    // signal to auto-pay so casting is seamless in the browser.
+    private static final String AUTO_LABEL = forge.util.Localizer.getInstance().getMessage("lblAuto");
+    /** Guards the auto-pay one-shot so a single mana prompt isn't OK'd repeatedly. */
+    private volatile boolean autoPayArmed = false;
+
     @Override
     public void updateButtons(PlayerView owner, String label1, String label2,
                               boolean enable1, boolean enable2, boolean focus1) {
@@ -545,6 +579,20 @@ public class WebGuiGame extends AbstractGuiGame {
             // prompts (coin toss -> keep hand -> priority ...) can keep OK enabled
             // throughout, and an auto-pilot must be able to answer each one.
             inputEpoch.incrementAndGet();
+        }
+
+        // Auto-pay: when Forge offers the "Auto" button (a legal mana payment exists),
+        // press OK for the player via Forge's own auto-tap (InputPayMana.onOk ->
+        // ComputerUtilMana.payManaCost). This collapses routine mana payment; genuinely
+        // ambiguous costs (no auto-payment -> OK disabled) still fall through to manual
+        // land-tapping via select. Fire once per prompt to avoid double-OK.
+        boolean isAutoPay = enable1 && !stopped && label1 != null && label1.equals(AUTO_LABEL);
+        if (isAutoPay && !autoPayArmed) {
+            autoPayArmed = true;
+            final IGameController c = firstController();
+            inputExec.submit(() -> { try { if (c != null) c.selectButtonOk(); } catch (Exception ignored) {} });
+        } else if (!isAutoPay) {
+            autoPayArmed = false;
         }
         pushState();
     }
@@ -856,12 +904,129 @@ public class WebGuiGame extends AbstractGuiGame {
         return new OrderResult<>(ordered, false);
     }
 
+    /** Client countdown for the sideboard screen (seconds); server grace is +20s beyond it. */
+    private static final int SIDEBOARD_TIMER_SECONDS = 120;
+
     @Override
     public List<PaperCard> sideboard(CardPool sideboard, CardPool main, String message) {
-        // [WEB-TODO] no sideboard UI yet — keep the current deck (never blocks; only
-        // relevant between games of a match).
-        todo("sideboard (default: keep deck)");
-        return null;
+        // Real between-games sideboard: publish the full 75 (main + side) to the browser
+        // deck-builder and block until it returns the chosen main (by pool index), a real
+        // round-trip like awaitDecision but on its own {status:"sideboard"} frame (there is
+        // no live GameView between games). Timeout / disconnect / an under-min result keeps
+        // the deck unchanged (return null), so the match never stalls here.
+        List<PaperCard> pool = new ArrayList<>();
+        List<PaperCard> mainList = main == null ? new ArrayList<>() : main.toFlatList();
+        List<PaperCard> sideList = sideboard == null ? new ArrayList<>() : sideboard.toFlatList();
+        pool.addAll(mainList);
+        pool.addAll(sideList);
+        int mainCount = mainList.size();
+        if (pool.isEmpty() || sideList.isEmpty()) {
+            // nothing to swap — keep the deck (mirrors PlayerControllerHuman's early-out)
+            return null;
+        }
+        // Floor for the new main: keep at least the current main size (a legal deck's main
+        // is already >= the format minimum, so this never drops below legal).
+        int minMain = mainCount;
+
+        List<Object> mainRefs = new ArrayList<>();
+        List<Object> sideRefs = new ArrayList<>();
+        for (int i = 0; i < pool.size(); i++) {
+            boolean inMain = i < mainCount;
+            (inMain ? mainRefs : sideRefs).add(sideboardCardRef(pool.get(i), i, inMain));
+        }
+
+        long id = reqSeq.incrementAndGet();
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("status", "sideboard");
+        frame.put("reqId", id);
+        frame.put("prompt", message == null ? "赛间换牌" : message);
+        frame.put("minMain", minMain);
+        frame.put("timer", SIDEBOARD_TIMER_SECONDS);
+        frame.put("main", mainRefs);
+        frame.put("side", sideRefs);
+
+        CompletableFuture<int[]> fut = new CompletableFuture<>();
+        sideboardReqId = id;
+        sideboardFuture = fut;
+        sideboardFrame = Json.write(frame);
+        pushState(); // browser now shows the sideboard screen
+
+        int[] chosen = null;
+        try {
+            chosen = fut.get(SIDEBOARD_TIMER_SECONDS + 20L, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // timeout / interrupt -> keep deck
+        } finally {
+            sideboardFrame = null;
+            sideboardFuture = null;
+            sideboardReqId = -1;
+        }
+        pushState(); // clear the sideboard frame (next real GameView follows for G2)
+
+        if (chosen == null) return null; // keep the deck unchanged
+        List<PaperCard> newMain = new ArrayList<>();
+        boolean[] used = new boolean[pool.size()];
+        for (int idx : chosen) {
+            if (idx >= 0 && idx < pool.size() && !used[idx]) {
+                used[idx] = true;
+                newMain.add(pool.get(idx));
+            }
+        }
+        if (newMain.size() < minMain) {
+            System.out.println("[WebGuiGame] sideboard rejected: main " + newMain.size() + " < min " + minMain);
+            return null; // under the floor -> keep the deck
+        }
+        System.out.println("[WebGuiGame] sideboard applied: main " + newMain.size()
+                + " (was " + mainCount + "), pool " + pool.size());
+        return newMain;
+    }
+
+    /** Complete a pending sideboard round-trip from the browser ({id:"sideboard"}). */
+    public void submitSideboard(long reqId, int[] mainIdx) {
+        CompletableFuture<int[]> f = sideboardFuture;
+        if (f != null && reqId == sideboardReqId) {
+            f.complete(mainIdx == null ? new int[0] : mainIdx);
+        }
+    }
+
+    /** Card descriptor for the sideboard deck-builder: identity by pool index (fid). */
+    private Map<String, Object> sideboardCardRef(PaperCard pc, int idx, boolean inMain) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        String name = pc.getName();
+        GameViewSerializer.CardImage img = GameViewSerializer.resolveImage(name, idx);
+        m.put("fid", String.valueOf(idx));
+        m.put("id", img.id);
+        m.put("name", name == null || name.isEmpty() ? "???" : name);
+        m.put("zh", img.zh);
+        m.put("img", img.img);
+        m.put("imgen", img.imgen);
+        int cmc = 0;
+        List<Object> types = new ArrayList<>();
+        String colors = "";
+        try {
+            forge.card.CardRules r = pc.getRules();
+            if (r != null) {
+                if (r.getManaCost() != null) cmc = r.getManaCost().getCMC();
+                if (r.getType() != null) {
+                    for (forge.card.CardType.CoreType c : r.getType().getCoreTypes()) types.add(c.name());
+                }
+                forge.card.ColorSet cs = r.getColor();
+                if (cs != null) {
+                    StringBuilder sb = new StringBuilder();
+                    if (cs.hasWhite()) sb.append('W');
+                    if (cs.hasBlue()) sb.append('U');
+                    if (cs.hasBlack()) sb.append('B');
+                    if (cs.hasRed()) sb.append('R');
+                    if (cs.hasGreen()) sb.append('G');
+                    colors = sb.toString();
+                }
+            }
+        } catch (Exception ignored) {}
+        m.put("cmc", cmc);
+        m.put("types", types);
+        m.put("colors", colors);
+        m.put("inMain", inMain);
+        return m;
     }
 
     @Override

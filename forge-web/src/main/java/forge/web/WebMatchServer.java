@@ -31,6 +31,8 @@ import forge.deck.Deck;
  *       entity (attack target / defender / spell target).</li>
  *   <li>{@code {"id":"nextgame"}} / {@code {"id":"quitmatch"}} — between-games decision
  *       after a game ends (continue to the next game of the match, or quit).</li>
+ *   <li>{@code {"id":"sideboard","reqId":N,"main":[fid...]}} — answer to a
+ *       {@code {"status":"sideboard",...}} frame: the pool indices to keep in the main deck.</li>
  *   <li>{@code {"id":"decide","reqId":N,"picks":[i...],"value":"..."}} — a dialog answer.</li>
  * </ul>
  * On connect the server pushes one lobby frame ({@code {"status":"lobby",...}}).
@@ -104,6 +106,8 @@ public class WebMatchServer extends WebSocketServer {
             if (reqId >= 0) gui.submitDecision(reqId, picks, value);
         } else if ("selectPlayer".equals(id)) {
             gui.submitSelectPlayer(str(msg.get("player")));
+        } else if ("sideboard".equals(id)) {
+            gui.submitSideboard(longOf(msg.get("reqId")), intArray(msg.get("main")));
         } else if ("nextgame".equals(id) || "continue".equals(id)) {
             gui.submitNextGame(true);
         } else if ("quitmatch".equals(id)) {
