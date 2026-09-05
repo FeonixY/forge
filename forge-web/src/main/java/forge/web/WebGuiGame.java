@@ -88,6 +88,28 @@ public class WebGuiGame extends AbstractGuiGame {
     // letting an auto-pilot client answer each prompt exactly once.
     private final AtomicInteger inputEpoch = new AtomicInteger();
 
+    // ---- "input ready" latch (event-driven select delivery) ----
+    // Forge sets up its next Input on the EDT a beat AFTER it pushes the "you may act"
+    // frame; a select/selectPlayer that lands in that window hits a stale/absent input and
+    // is silently dropped. Rather than blind-poll a fixed window, we signal this monitor
+    // from every Input.showMessage callback (updateButtons/showPromptMessage/setSelectables)
+    // and have inbound actions park on it and retry the instant a fresh input appears.
+    private final Object inputReadyMon = new Object();
+    private volatile long inputReadyTick = 0;
+    /** Ceiling for waiting out the input-registration race before giving up a select. */
+    private static final long SELECT_TIMEOUT_MS = 2500;
+
+    private void signalInputReady() {
+        synchronized (inputReadyMon) { inputReadyTick++; inputReadyMon.notifyAll(); }
+    }
+    /** Block up to {@code ms} for the next input-ready signal (or a spurious wakeup). */
+    private void waitInputReady(long ms) {
+        synchronized (inputReadyMon) {
+            try { inputReadyMon.wait(ms); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+    }
+
     // ---- dialog-decision round-trip state ----
     /** Answer from the browser: chosen option indices and/or a raw value (number/text/CSV). */
     public record Answer(int[] picks, String value) {}
@@ -246,6 +268,7 @@ public class WebGuiGame extends AbstractGuiGame {
         stopped = true;
         sink = null;                 // no more sends to a closed connection
         answerPendingDefault();      // unblock a parked awaitDecision
+        signalInputReady();          // wake any select/selectPlayer parked on the input-ready latch
         CompletableFuture<int[]> sf = sideboardFuture; // unblock a parked sideboard()
         if (sf != null) sf.complete(null);
         try {
@@ -289,13 +312,27 @@ public class WebGuiGame extends AbstractGuiGame {
         if (stopped) return;
         inputExec.submit(() -> {
             try {
-                IGameController ctrl = firstController();
-                PlayerView pv = resolvePlayer(token);
-                if (ctrl != null && pv != null) {
-                    ctrl.selectPlayer(pv, null);
-                } else {
-                    System.err.println("[WebGuiGame] selectPlayer unresolved: " + token);
+                final PlayerView pv = resolvePlayer(token);
+                if (pv == null) { System.err.println("[WebGuiGame] selectPlayer unresolved: " + token); return; }
+                // selectPlayer() returns void and, on a TARGETING input (InputSelectTargets),
+                // onPlayerSelected TOGGLES the player as a target — so re-sending is unsafe (it can
+                // toggle a chosen target back off). We therefore send EXACTLY ONCE, but only after
+                // the player-choosing input is actually live. The race the coordinator hit is a
+                // too-early send (the input isn't registered yet, so the click is dropped), so we
+                // park on the input-ready latch until the targeting/defender prompt is showing, then
+                // send a single time. isSelecting() is false for a players-only target (Lightning
+                // Bolt with no creatures -> empty card selectables), so we also accept the prompt as
+                // the readiness signal (en-US: "...Select any target" / "...target..."/"defender").
+                final long deadline = System.currentTimeMillis() + SELECT_TIMEOUT_MS;
+                boolean ready = false;
+                while (!stopped && System.currentTimeMillis() < deadline) {
+                    if (targetInputReady()) { ready = true; break; }
+                    waitInputReady(100);
                 }
+                IGameController ctrl = firstController();
+                if (ctrl != null) ctrl.selectPlayer(pv, null);
+                System.out.println("[WebGuiGame] selectPlayer " + token + " (pv=" + pv.getId()
+                        + ") sent; inputReady=" + ready);
             } catch (Exception e) {
                 System.err.println("[WebGuiGame] selectPlayer '" + token + "' failed: " + e);
             }
@@ -323,6 +360,20 @@ public class WebGuiGame extends AbstractGuiGame {
                 System.err.println("[WebGuiGame] nextGame failed: " + e);
             }
         });
+    }
+
+    /**
+     * True when an input that accepts a player selection is live: a card-target selection
+     * (InputSelectTargets with card options -> isSelecting()), or — since a players-only
+     * target sets an empty card list — the current prompt asks for a target/defender.
+     * Used to hold a selectPlayer until the input is registered (en-US prompts).
+     */
+    private boolean targetInputReady() {
+        if (isSelecting()) return true;
+        String p = promptText;
+        if (p == null) return false;
+        String s = p.toLowerCase();
+        return s.contains("target") || s.contains("defender");
     }
 
     /** Map a browser player token ("you"/"opp"/"p1"/"p2") to a PlayerView. */
@@ -369,20 +420,19 @@ public class WebGuiGame extends AbstractGuiGame {
             case "play": case "select": {
                 CardView cv = cardId == null ? null : findCard(Integer.parseInt(cardId));
                 if (cv != null) {
-                    // Retry: selectCard fails when the target Input isn't the active one yet
-                    // (Forge registers InputPassPriority / InputAttack / InputBlock on the EDT
-                    // a beat after it publishes "you have priority", so a select that arrives in
-                    // that window hits a stale/absent input and returns false — this is exactly
-                    // why casting looked broken: land drops sometimes flapped and creature casts
-                    // never started). Poll briefly until the input is ready; a genuinely illegal
-                    // action simply stays false through all attempts and costs only a few ms.
+                    // Event-driven delivery: selectCard fails when the target Input (InputPassPriority
+                    // / InputAttack / InputBlock / InputSelectTargets) isn't the active one yet — Forge
+                    // registers it on the EDT a beat after publishing "you may act". Instead of a fixed
+                    // poll window (too short on a loaded server), we retry the instant a fresh input
+                    // appears (signalInputReady) and keep going up to a generous ceiling. onCardSelected
+                    // only returns false when it changed NOTHING, so retrying can never double-apply.
                     boolean ok = false;
-                    for (int attempt = 0; attempt < 12 && !ok && !stopped; attempt++) {
+                    final long deadline = System.currentTimeMillis() + SELECT_TIMEOUT_MS;
+                    while (!ok && !stopped && System.currentTimeMillis() < deadline) {
                         ok = ctrl.selectCard(cv, null, null);
                         if (ok) break;
-                        try { Thread.sleep(40); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-                        // refresh the CardView each retry (the tracker may replace it across a state push)
-                        CardView cv2 = findCard(Integer.parseInt(cardId));
+                        waitInputReady(120); // wake immediately on the next input-ready signal
+                        CardView cv2 = findCard(Integer.parseInt(cardId)); // tracker may swap the view
                         if (cv2 != null) cv = cv2;
                     }
                     System.out.println("[WebGuiGame] select id=" + cardId + " name="
@@ -557,6 +607,7 @@ public class WebGuiGame extends AbstractGuiGame {
     @Override
     public void showPromptMessage(PlayerView playerView, String message, CardView card) {
         this.promptText = message == null ? "" : message;
+        signalInputReady(); // an Input is showing its message -> ready to accept selects
         pushState();
     }
 
@@ -574,6 +625,7 @@ public class WebGuiGame extends AbstractGuiGame {
         this.cancelLabel = label2;
         this.okEnabled = enable1;
         this.cancelEnabled = enable2;
+        signalInputReady(); // a button set == an Input is live and ready for selects
         if (enable1) {
             // Bump on every OK-enabled prompt (not just false->true): consecutive
             // prompts (coin toss -> keep hand -> priority ...) can keep OK enabled
@@ -602,6 +654,7 @@ public class WebGuiGame extends AbstractGuiGame {
         super.setSelectables(cards, min, max);
         for (CardView cv : cards) selectableIds.add(cv.getId());
         inputEpoch.incrementAndGet();
+        signalInputReady(); // a selection input (targeting/combat) just went live
         pushState();
     }
 
