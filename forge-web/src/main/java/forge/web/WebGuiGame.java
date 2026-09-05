@@ -52,9 +52,13 @@ import forge.util.ITriggerEvent;
  * {@link #answerPendingDefault}. A null completion means "use the caller's safe
  * default", which keeps the headless SmokeTest able to finish a whole game.
  * Priority / attackers / blockers flow separately through the Input framework
- * (updateButtons/showPromptMessage/setSelectables -> submitAction). A few bulk
- * decisions (assignCombatDamage/order/sideboard/manipulateCardList) keep improved
- * default stubs, tagged {@code [WEB-TODO]}, and never block.
+ * (updateButtons/showPromptMessage/setSelectables -> submitAction). Bulk decisions
+ * assignCombatDamage/assignGenericAmount/order/manipulateCardList do a real browser
+ * round-trip (successive picks / amount CSV) with a safe default on timeout. The
+ * London mulligan tuck reuses the {@code select} protocol via
+ * {@link #addMulliganTuckActions} (the Input framework issues no setSelectables there).
+ * Only {@link #sideboard} remains a non-blocking default stub (keeps the deck between
+ * games), tagged {@code [WEB-TODO]}.
  */
 public class WebGuiGame extends AbstractGuiGame {
 
@@ -167,7 +171,32 @@ public class WebGuiGame extends AbstractGuiGame {
                 actions.add(action("select", name, String.valueOf(cv.getId())));
             }
         }
+        addMulliganTuckActions(actions, you);
         return actions;
+    }
+
+    /**
+     * London mulligan tuck step: {@code InputLondonMulligan} does NOT call
+     * {@code setSelectables}, so the browser would otherwise have no labeled way to
+     * choose <em>which</em> cards go to the bottom of the library — only the "Auto"
+     * (cancel) button, which forces Forge to pick the first N. When the engine is in
+     * the mulligan-return phase ({@code GameView.isMulligan()}), surface each hand card
+     * as a plain {@code select} action so a click routes through
+     * {@code doAction("select") -> IGameController.selectCard -> onCardSelected}, which
+     * toggles that card into the tuck set. {@link #isHighlighted} reflects the cards the
+     * engine has already flagged as picked (by id), so the label flips between add/remove.
+     * Uses only the existing {@code select} protocol; no new browser message is required.
+     */
+    private void addMulliganTuckActions(List<Map<String, Object>> actions, PlayerView you) {
+        GameView gv = getGameView();
+        if (gv == null || !gv.isMulligan()) return;
+        if (you == null || you.getHand() == null) return;
+        for (CardView cv : you.getHand()) {
+            String name = cv.getCurrentState() != null ? cv.getCurrentState().getName() : cv.getName();
+            boolean picked = isHighlighted(cv);
+            String label = (picked ? "取消放回：" : "放回牌库底：") + name;
+            actions.add(action("select", label, String.valueOf(cv.getId())));
+        }
     }
 
     private static Map<String, Object> action(String id, String label, String cardId) {
