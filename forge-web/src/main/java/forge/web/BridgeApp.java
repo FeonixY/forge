@@ -37,6 +37,14 @@ public final class BridgeApp {
         // Load the card DB once, up front, so the first connection doesn't pay for it.
         MatchBootstrap.ensureInitialized();
 
+        // Keep the Swing EDT warm. The Input framework posts prompt setup via
+        // SwingUtilities.invokeLater; in headless mode the EDT (EventDispatchThread) stops
+        // when its queue drains and only lazily restarts, so between/after games there is a
+        // window with no live EDT -> queued input-setup runs late or not at all -> selectCard
+        // fails ("flaky, worse under load / over many games"). A tiny periodic no-op keeps the
+        // EDT alive for the life of the process, making input registration deterministic.
+        startEdtKeepAlive();
+
         WebMatchServer server = new WebMatchServer(host, port);
         server.start();
         System.out.println("[bridge] WebSocket bridge listening on ws://" + host + ":" + port);
@@ -44,6 +52,25 @@ public final class BridgeApp {
 
         // Keep the JVM alive.
         Thread.currentThread().join();
+    }
+
+    /** Pin the headless Swing EDT alive so input-setup tasks always have a live dispatcher. */
+    private static void startEdtKeepAlive() {
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    javax.swing.SwingUtilities.invokeLater(() -> { });
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Throwable ignored) {
+                    // never let the keep-alive die
+                }
+            }
+        }, "edt-keepalive");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static String firstNonEmpty(String... vals) {
