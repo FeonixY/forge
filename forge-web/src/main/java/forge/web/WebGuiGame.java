@@ -82,6 +82,19 @@ public class WebGuiGame extends AbstractGuiGame {
                 t.setDaemon(true);
                 return t;
             });
+
+    // Builds+sends the JSON snapshot OFF the caller thread. Crucial: state callbacks
+    // (updateButtons/showPromptMessage/updateCards...) run on the single shared Swing EDT,
+    // and building the full GameView JSON there would hog the EDT — under back-to-back games
+    // that starves the very input-registration the EDT must also do, so selects start failing.
+    // Handing serialization to this per-connection thread keeps the EDT free and input
+    // registration prompt. Single-thread => frames stay ordered.
+    private final ExecutorService pushExec =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "web-push");
+                t.setDaemon(true);
+                return t;
+            });
     private volatile boolean stopped = false;
 
     // Monotonic id bumped whenever a fresh "your turn to act" prompt appears,
@@ -164,9 +177,17 @@ public class WebGuiGame extends AbstractGuiGame {
         return Json.write(root);
     }
 
-    // Synchronized so pushes from the game thread and the input worker never
-    // interleave a sink write (keeps the JSONL / WS frame stream well-formed).
-    private synchronized void pushState() {
+    // Hand serialization+send to the per-connection push thread so the calling thread —
+    // usually the shared Swing EDT running a state callback — returns immediately and stays
+    // free to register the next input. Never build the (heavy) JSON on the EDT.
+    private void pushState() {
+        if (sink == null || stopped) return;
+        try { pushExec.execute(this::doPush); }
+        catch (Exception ignored) { /* executor stopping */ }
+    }
+
+    // Synchronized so the single push thread's writes never interleave (well-formed frames).
+    private synchronized void doPush() {
         Sink s = sink;
         if (s == null) return;
         try {
@@ -276,6 +297,7 @@ public class WebGuiGame extends AbstractGuiGame {
             inputExec.submit(() -> { try { if (c != null) c.concede(); } catch (Exception ignored) {} });
         } catch (Exception ignored) {}
         inputExec.shutdown();        // run the queued concede, then stop accepting work
+        pushExec.shutdownNow();      // drop any pending frame builds for this closed connection
     }
 
     public boolean isStopped() { return stopped; }
