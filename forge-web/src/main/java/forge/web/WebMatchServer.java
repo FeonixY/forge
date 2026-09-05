@@ -24,7 +24,13 @@ import forge.deck.Deck;
  * <ul>
  *   <li>{@code {"id":"newgame"[, "deck":"<Arena decklist>"]}} — (re)start this
  *       connection's game; no/blank deck uses the default. Send before playing.</li>
- *   <li>{@code {"id":"pass"|"play"|"select"|"cancel"|"concede", "cardId":"..."}} — an action.</li>
+ *   <li>{@code {"id":"pass"|"play"|"select"|"cancel"|"concede", "cardId":"..."}} — an action.
+ *       {@code select}/{@code play} on any own hand card / permanent drives the Forge
+ *       "click a card" inputs (cast/attack/block); the engine validates legality.</li>
+ *   <li>{@code {"id":"selectPlayer","player":"you"|"opp"|"p1"|"p2"}} — select a player
+ *       entity (attack target / defender / spell target).</li>
+ *   <li>{@code {"id":"nextgame"}} / {@code {"id":"quitmatch"}} — between-games decision
+ *       after a game ends (continue to the next game of the match, or quit).</li>
  *   <li>{@code {"id":"decide","reqId":N,"picks":[i...],"value":"..."}} — a dialog answer.</li>
  * </ul>
  * On connect the server pushes one lobby frame ({@code {"status":"lobby",...}}).
@@ -96,6 +102,12 @@ public class WebMatchServer extends WebSocketServer {
             String value = str(msg.get("value"));
             System.out.println("[ws] decide reqId=" + reqId + " picks=" + Arrays.toString(picks));
             if (reqId >= 0) gui.submitDecision(reqId, picks, value);
+        } else if ("selectPlayer".equals(id)) {
+            gui.submitSelectPlayer(str(msg.get("player")));
+        } else if ("nextgame".equals(id) || "continue".equals(id)) {
+            gui.submitNextGame(true);
+        } else if ("quitmatch".equals(id)) {
+            gui.submitNextGame(false);
         } else if (id != null) {
             gui.submitAction(id, str(msg.get("cardId")));
         }

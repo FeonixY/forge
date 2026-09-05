@@ -60,7 +60,16 @@ public final class GameViewSerializer {
         root.put("turn", gv == null ? null : playerId(gv.getPlayerTurn(), players));
         root.put("priority", playerId(priorityPlayer(players), players));
         root.put("phase", phaseCode(gv == null ? null : gv.getPhase()));
+        // Raw phase step (additive): lets the browser distinguish combat sub-steps
+        // (declare-attackers vs declare-blockers) that phaseCode() collapses to "COMBAT".
+        root.put("step", gv == null || gv.getPhase() == null ? "" : gv.getPhase().name());
         root.put("prompt", prompt == null ? "" : prompt);
+        // End-of-game signals (additive): drive the browser's "next game / match over" UI.
+        if (gv != null) {
+            root.put("gameOver", gv.isGameOver());
+            root.put("matchOver", gv.isMatchOver());
+            if (gv.isGameOver()) root.put("winner", gv.getWinningPlayerName());
+        }
 
         List<Object> playersJson = new ArrayList<>();
         for (PlayerView pv : players) {
@@ -129,6 +138,9 @@ public final class GameViewSerializer {
         // Resolve Scryfall id + Chinese name + mtgch image URLs from the bundled index.
         CardImage img = resolveImage(name, cv.getId());
         ref.put("id", img.id);
+        // Forge engine id (additive): the stable integer key the browser must send back
+        // as {@code cardId} for select/play, since {@code id} above may be a Scryfall id.
+        ref.put("fid", String.valueOf(cv.getId()));
         ref.put("name", name == null || name.isEmpty() ? "???" : name);
         ref.put("zh", img.zh);
         ref.put("tapped", cv.isTapped());

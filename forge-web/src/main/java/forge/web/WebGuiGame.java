@@ -152,7 +152,12 @@ public class WebGuiGame extends AbstractGuiGame {
     private List<Map<String, Object>> buildActions() {
         List<Map<String, Object>> actions = new ArrayList<>();
         if (okEnabled) {
-            actions.add(action("pass", "过优先权 / OK", null));
+            // Reflect the engine's real OK label when it carries meaning ("Auto" for
+            // mana auto-pay, "Keep" for mulligan, "OK" to end combat), else the default
+            // "pass priority" wording. Lets the browser button read correctly per phase.
+            String ok = (okLabel != null && !okLabel.isBlank() && !okLabel.equalsIgnoreCase("OK"))
+                    ? okLabel : "过优先权 / OK";
+            actions.add(action("pass", ok, null));
         }
         if (cancelEnabled) {
             actions.add(action("cancel", cancelLabel == null ? "取消" : cancelLabel, null));
@@ -261,6 +266,77 @@ public class WebGuiGame extends AbstractGuiGame {
         });
     }
 
+    /**
+     * Browser selected a player entity (attack target / spell target / defender choice).
+     * {@code token} is a player handle: {@code "you"}, {@code "opp"}, or {@code "p1"/"p2"}
+     * (the same ids GameViewSerializer emits). Routes to
+     * {@code IGameController.selectPlayer}, which the active input (InputAttack /
+     * InputSelectTargets / ...) interprets. Runs on the input worker.
+     */
+    public void submitSelectPlayer(final String token) {
+        if (stopped) return;
+        inputExec.submit(() -> {
+            try {
+                IGameController ctrl = firstController();
+                PlayerView pv = resolvePlayer(token);
+                if (ctrl != null && pv != null) {
+                    ctrl.selectPlayer(pv, null);
+                } else {
+                    System.err.println("[WebGuiGame] selectPlayer unresolved: " + token);
+                }
+            } catch (Exception e) {
+                System.err.println("[WebGuiGame] selectPlayer '" + token + "' failed: " + e);
+            }
+        });
+    }
+
+    /**
+     * Browser's between-games decision after a game ends: continue to the next game of
+     * the match ({@code cont=true}) or quit the match. Forge blocks the match on this
+     * for human players (HostedMatch does not auto-advance when a human is present), so
+     * without it G2 never starts. Sideboard is a keep-deck stub, so continue replays the
+     * same deck. Runs on the input worker.
+     */
+    public void submitNextGame(final boolean cont) {
+        if (stopped) return;
+        inputExec.submit(() -> {
+            try {
+                IGameController ctrl = firstController();
+                if (ctrl != null) {
+                    ctrl.nextGameDecision(cont
+                            ? forge.gamemodes.match.NextGameDecision.CONTINUE
+                            : forge.gamemodes.match.NextGameDecision.QUIT);
+                }
+            } catch (Exception e) {
+                System.err.println("[WebGuiGame] nextGame failed: " + e);
+            }
+        });
+    }
+
+    /** Map a browser player token ("you"/"opp"/"p1"/"p2") to a PlayerView. */
+    private PlayerView resolvePlayer(String token) {
+        if (token == null) return null;
+        GameView gv = getGameView();
+        List<PlayerView> players = new ArrayList<>();
+        if (gv != null && gv.getPlayers() != null) {
+            for (PlayerView pv : gv.getPlayers()) players.add(pv);
+        }
+        if ("you".equalsIgnoreCase(token)) return humanView;
+        if ("opp".equalsIgnoreCase(token)) {
+            for (PlayerView pv : players) {
+                if (humanView == null || pv.getId() != humanView.getId()) return pv;
+            }
+            return null;
+        }
+        if (token.length() >= 2 && (token.charAt(0) == 'p' || token.charAt(0) == 'P')) {
+            try {
+                int idx = Integer.parseInt(token.substring(1)) - 1;
+                if (idx >= 0 && idx < players.size()) return players.get(idx);
+            } catch (NumberFormatException ignored) {}
+        }
+        return null;
+    }
+
     private void doAction(String id, String cardId) {
         IGameController ctrl = getGameController(humanView);
         if (ctrl == null) ctrl = getGameController();
@@ -281,7 +357,10 @@ public class WebGuiGame extends AbstractGuiGame {
             case "play": case "select": {
                 CardView cv = cardId == null ? null : findCard(Integer.parseInt(cardId));
                 if (cv != null) {
-                    ctrl.selectCard(cv, null, null);
+                    boolean ok = ctrl.selectCard(cv, null, null);
+                    System.out.println("[WebGuiGame] select id=" + cardId + " name="
+                            + (cv.getCurrentState()!=null?cv.getCurrentState().getName():cv.getName())
+                            + " -> selectCard=" + ok);
                 } else {
                     System.err.println("[WebGuiGame] card not found: " + cardId);
                 }
