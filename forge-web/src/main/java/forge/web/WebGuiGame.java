@@ -633,13 +633,6 @@ public class WebGuiGame extends AbstractGuiGame {
         pushState();
     }
 
-    // Localized "Auto" label — InputPayMana is the ONLY input that puts it on the OK
-    // button (enable1), and only when a legal auto-payment exists. We use that as the
-    // signal to auto-pay so casting is seamless in the browser.
-    private static final String AUTO_LABEL = forge.util.Localizer.getInstance().getMessage("lblAuto");
-    /** Guards the auto-pay one-shot so a single mana prompt isn't OK'd repeatedly. */
-    private volatile boolean autoPayArmed = false;
-
     @Override
     public void updateButtons(PlayerView owner, String label1, String label2,
                               boolean enable1, boolean enable2, boolean focus1) {
@@ -655,19 +648,12 @@ public class WebGuiGame extends AbstractGuiGame {
             inputEpoch.incrementAndGet();
         }
 
-        // Auto-pay: when Forge offers the "Auto" button (a legal mana payment exists),
-        // press OK for the player via Forge's own auto-tap (InputPayMana.onOk ->
-        // ComputerUtilMana.payManaCost). This collapses routine mana payment; genuinely
-        // ambiguous costs (no auto-payment -> OK disabled) still fall through to manual
-        // land-tapping via select. Fire once per prompt to avoid double-OK.
-        boolean isAutoPay = enable1 && !stopped && label1 != null && label1.equals(AUTO_LABEL);
-        if (isAutoPay && !autoPayArmed) {
-            autoPayArmed = true;
-            final IGameController c = firstController();
-            inputExec.submit(() -> { try { if (c != null) c.selectButtonOk(); } catch (Exception ignored) {} });
-        } else if (!isAutoPay) {
-            autoPayArmed = false;
-        }
+        // NOTE: mana auto-pay is OPTIONAL, not forced. When Forge offers its "Auto"
+        // button (a legal auto-payment exists), we simply surface it as the OK action
+        // (buildActions() carries the "Auto" label through). The browser shows it as a
+        // clickable "自动支付" button; the engine only auto-taps when the PLAYER clicks it
+        // (doAction("pass") -> selectButtonOk). Manual land-tapping via select stays
+        // available for players who want to choose which lands pay.
         pushState();
     }
 
