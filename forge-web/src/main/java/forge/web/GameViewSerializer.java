@@ -122,8 +122,43 @@ public final class GameViewSerializer {
         }
         root.put("stack", stack);
 
+        // Combat (additive): straight from the engine's CombatView so BOTH players'
+        // attackers/blockers and the who-attacks/blocks-whom relationships can be marked
+        // in the browser. combat = { attackers:[{fid, defender, blockedBy:[fid]}] } or null.
+        // defender = "p1"/"p2" for a player, or "card:<fid>" for a planeswalker.
+        forge.game.combat.CombatView cv = gv != null ? gv.getCombat() : null;
+        if (cv != null && cv.getNumAttackers() > 0) {
+            List<Object> atks = new ArrayList<>();
+            for (CardView atk : cv.getAttackers()) {
+                if (atk == null) continue;
+                Map<String, Object> a = new LinkedHashMap<>();
+                a.put("fid", String.valueOf(atk.getId()));
+                a.put("defender", entityId(cv.getDefender(atk), players));
+                List<Object> bl = new ArrayList<>();
+                var blockers = cv.getBlockers(atk);
+                if (blockers != null) {
+                    for (CardView b : blockers) if (b != null) bl.add(String.valueOf(b.getId()));
+                }
+                if (!bl.isEmpty()) a.put("blockedBy", bl);
+                atks.add(a);
+            }
+            Map<String, Object> combat = new LinkedHashMap<>();
+            combat.put("attackers", atks);
+            root.put("combat", combat);
+        } else {
+            root.put("combat", null);
+        }
+
         root.put("actions", actions == null ? new ArrayList<>() : actions);
         return root;
+    }
+
+    /** Map a combat defender to a wire id: "p1"/"p2" for a player, "card:&lt;fid&gt;" for a planeswalker. */
+    private static String entityId(forge.game.GameEntityView e, List<PlayerView> players) {
+        if (e == null) return null;
+        if (e instanceof PlayerView) return playerId((PlayerView) e, players);
+        if (e instanceof CardView) return "card:" + ((CardView) e).getId();
+        return null;
     }
 
     private static Map<String, Object> playerToMap(PlayerView pv, List<PlayerView> players, PlayerView viewer) {
