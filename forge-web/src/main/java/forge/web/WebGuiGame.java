@@ -725,7 +725,34 @@ public class WebGuiGame extends AbstractGuiGame {
     @Override public void showErrorDialog(String message, String title) {
         System.err.println("[err] " + title + ": " + message);
     }
-    @Override public boolean isUiSetToSkipPhase(PlayerView playerTurn, forge.game.phase.PhaseType phase) { return false; }
+    // ---- priority "stops" (auto-pass) config, sent by the browser ----
+    // A phase is a STOP point (prompt the human) if its PhaseType name is in the relevant set;
+    // otherwise Forge auto-passes that priority window (PlayerControllerHuman.getSpellAbilityToPlay
+    // consults isUiSetToSkipPhase and, with an empty stack, returns null instead of prompting).
+    // This ONLY gates priority windows — InputAttack/InputBlock (declare attackers/blockers) are
+    // separate forced inputs and are never affected. null sets => never skip (default: stop at
+    // every priority, which keeps the headless self-check bot, that pushes explicit passes, working).
+    private volatile java.util.Set<String> stopsMine;   // stop points on MY turn
+    private volatile java.util.Set<String> stopsOpp;    // stop points on the OPPONENT's turn
+
+    /** Browser sets which (phase, whose-turn) priority windows to stop at. Runs on any thread. */
+    public void setStops(java.util.Set<String> mine, java.util.Set<String> opp) {
+        this.stopsMine = mine;
+        this.stopsOpp = opp;
+    }
+
+    @Override
+    public boolean isUiSetToSkipPhase(PlayerView playerTurn, forge.game.phase.PhaseType phase) {
+        // true => skip (auto-pass) this empty-stack priority window; false => stop and prompt.
+        // Forge's PlayerControllerHuman.getSpellAbilityToPlay consults this before creating
+        // InputPassPriority (only when the stack is empty), so this never affects declare
+        // attackers/blockers or stack responses — exactly the desired "priority stops" behaviour.
+        if (stopsMine == null && stopsOpp == null) return false; // no config -> always stop
+        boolean myTurn = humanView != null && playerTurn != null
+                && playerTurn.getId() == humanView.getId();
+        java.util.Set<String> stops = myTurn ? stopsMine : stopsOpp;
+        return stops != null && !stops.contains(phase.name()); // stop only at configured phases
+    }
 
     @Override
     public Iterable<PlayerZoneUpdate> tempShowZones(PlayerView controller, Iterable<PlayerZoneUpdate> zonesToUpdate) {

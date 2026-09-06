@@ -33,6 +33,9 @@ import forge.deck.Deck;
  *       after a game ends (continue to the next game of the match, or quit).</li>
  *   <li>{@code {"id":"sideboard","reqId":N,"main":[fid...]}} — answer to a
  *       {@code {"status":"sideboard",...}} frame: the pool indices to keep in the main deck.</li>
+ *   <li>{@code {"id":"stops","mine":[PhaseType...],"opp":[PhaseType...]}} — which priority
+ *       windows to stop at (PhaseType names, e.g. MAIN1, COMBAT_DECLARE_ATTACKERS); every other
+ *       priority window is auto-passed. Only affects priority — never declare attackers/blockers.</li>
  *   <li>{@code {"id":"decide","reqId":N,"picks":[i...],"value":"..."}} — a dialog answer.</li>
  * </ul>
  * On connect the server pushes one lobby frame ({@code {"status":"lobby",...}}).
@@ -106,6 +109,8 @@ public class WebMatchServer extends WebSocketServer {
             if (reqId >= 0) gui.submitDecision(reqId, picks, value);
         } else if ("selectPlayer".equals(id)) {
             gui.submitSelectPlayer(str(msg.get("player")));
+        } else if ("stops".equals(id)) {
+            gui.setStops(strSet(msg.get("mine")), strSet(msg.get("opp")));
         } else if ("sideboard".equals(id)) {
             gui.submitSideboard(longOf(msg.get("reqId")), intArray(msg.get("main")));
         } else if ("nextgame".equals(id) || "continue".equals(id)) {
@@ -186,6 +191,14 @@ public class WebMatchServer extends WebSocketServer {
             if (e instanceof Number n) out[i++] = n.intValue();
             else { try { out[i++] = Integer.parseInt(String.valueOf(e).trim()); } catch (Exception ex) { out[i++] = -1; } }
         }
+        return out;
+    }
+
+    /** Parse a JSON array of phase names into a set; null (not an array) stays null (= no config). */
+    private static java.util.Set<String> strSet(Object o) {
+        if (!(o instanceof List<?> list)) return null;
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (Object e : list) if (e != null) out.add(String.valueOf(e));
         return out;
     }
 }

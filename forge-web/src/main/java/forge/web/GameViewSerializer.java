@@ -111,6 +111,11 @@ public final class GameViewSerializer {
         p.put("handCount", pv.getZoneSize(ZoneType.Hand));
         p.put("libraryCount", pv.getZoneSize(ZoneType.Library));
         p.put("graveyardCount", pv.getZoneSize(ZoneType.Graveyard));
+        p.put("exileCount", pv.getZoneSize(ZoneType.Exile));
+        // Graveyard and exile are public zones — send their contents so the browser can
+        // show them on demand (library stays count-only; hidden info is never serialized).
+        p.put("graveyard", zoneRefs(pv, ZoneType.Graveyard));
+        p.put("exile", zoneRefs(pv, ZoneType.Exile));
 
         Map<String, Object> mana = new LinkedHashMap<>();
         mana.put("W", pv.getMana(MagicColor.WHITE));
@@ -127,6 +132,14 @@ public final class GameViewSerializer {
         }
         p.put("battlefield", bf);
         return p;
+    }
+
+    /** Serialize a public zone's cards to cardRefs (empty list if none/hidden). */
+    private static List<Object> zoneRefs(PlayerView pv, ZoneType zone) {
+        List<Object> out = new ArrayList<>();
+        var coll = pv.getCards(zone);
+        if (coll != null) for (CardView cv : coll) out.add(cardRef(cv));
+        return out;
     }
 
     /** Build a cardRef per the contract. */
