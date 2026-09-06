@@ -73,7 +73,7 @@ public final class GameViewSerializer {
 
         List<Object> playersJson = new ArrayList<>();
         for (PlayerView pv : players) {
-            playersJson.add(playerToMap(pv, players));
+            playersJson.add(playerToMap(pv, players, you));
         }
         root.put("players", playersJson);
 
@@ -126,7 +126,7 @@ public final class GameViewSerializer {
         return root;
     }
 
-    private static Map<String, Object> playerToMap(PlayerView pv, List<PlayerView> players) {
+    private static Map<String, Object> playerToMap(PlayerView pv, List<PlayerView> players, PlayerView viewer) {
         Map<String, Object> p = new LinkedHashMap<>();
         p.put("id", playerId(pv, players));
         p.put("name", pv.getName());
@@ -139,6 +139,27 @@ public final class GameViewSerializer {
         // show them on demand (library stays count-only; hidden info is never serialized).
         p.put("graveyard", zoneRefs(pv, ZoneType.Graveyard));
         p.put("exile", zoneRefs(pv, ZoneType.Exile));
+        // Command zone is public (emblems, commanders, companion + companion effect,
+        // detached "this-turn" effect cards). The browser reads it for the left-column
+        // companion/effect tab and the battlefield-side effect icons.
+        p.put("command", zoneRefs(pv, ZoneType.Command));
+        // Library-known: cards the *viewer* is allowed to look at (scry/surveil/reveal-top
+        // grant per-card look permission), with pos = index from the top (0 = top). Hidden
+        // library cards are never serialized — the browser shows card backs for the rest.
+        List<Object> libKnown = new ArrayList<>();
+        var lib = pv.getCards(ZoneType.Library);
+        if (lib != null) {
+            int pos = 0;
+            for (CardView cv : lib) {
+                if (viewer != null && cv.canBeShownTo(viewer)) {
+                    Map<String, Object> e = cardRef(cv);
+                    e.put("pos", pos);
+                    libKnown.add(e);
+                }
+                pos++;
+            }
+        }
+        p.put("libraryKnown", libKnown);
 
         Map<String, Object> mana = new LinkedHashMap<>();
         mana.put("W", pv.getMana(MagicColor.WHITE));
@@ -180,6 +201,8 @@ public final class GameViewSerializer {
         ref.put("name", name == null || name.isEmpty() ? "???" : name);
         ref.put("zh", img.zh);
         ref.put("tapped", cv.isTapped());
+        // Emblem flag (additive): drives the battlefield-side effect icon in the browser.
+        if (cv.isEmblem()) ref.put("isEmblem", true);
 
         List<Object> types = new ArrayList<>();
         boolean isCreature = false;
