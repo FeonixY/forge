@@ -84,7 +84,8 @@ public final class GameViewSerializer {
         }
         root.put("hand", hand);
 
-        // Stack (top-most last, matching Forge order; battle.html renders left-to-right).
+        // Stack (top-most last, matching Forge order). Each item carries its targets
+        // (card + player names) so the browser can show what each spell/ability points at.
         List<Object> stack = new ArrayList<>();
         if (gv != null && gv.getStack() != null) {
             for (forge.game.spellability.StackItemView si : gv.getStack()) {
@@ -94,6 +95,28 @@ public final class GameViewSerializer {
                 if (si.getText() != null && !si.getText().isEmpty()) {
                     ref.put("note", si.getText());
                 }
+                List<Object> tgts = new ArrayList<>();
+                if (si.getTargetCards() != null) {
+                    for (CardView tc : si.getTargetCards()) {
+                        String en = tc.getCurrentState() != null ? tc.getCurrentState().getName() : tc.getName();
+                        CardImage ti = resolveImage(en, tc.getId());
+                        Map<String, Object> t = new LinkedHashMap<>();
+                        t.put("kind", "card");
+                        t.put("name", (ti.zh != null && !ti.zh.isEmpty()) ? ti.zh : (en == null ? "?" : en));
+                        t.put("fid", String.valueOf(tc.getId()));
+                        tgts.add(t);
+                    }
+                }
+                if (si.getTargetPlayers() != null) {
+                    for (PlayerView tp : si.getTargetPlayers()) {
+                        Map<String, Object> t = new LinkedHashMap<>();
+                        t.put("kind", "player");
+                        t.put("name", tp.getName());
+                        t.put("player", playerId(tp, players));
+                        tgts.add(t);
+                    }
+                }
+                if (!tgts.isEmpty()) ref.put("targets", tgts);
                 stack.add(ref);
             }
         }
