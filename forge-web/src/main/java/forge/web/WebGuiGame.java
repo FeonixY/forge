@@ -741,6 +741,10 @@ public class WebGuiGame extends AbstractGuiGame {
         this.stopsOpp = opp;
     }
 
+    /** Brief pause before an auto-passed phase so the browser shows the ladder advance step by
+     *  step instead of the game jumping ahead in one burst. Game thread only; never the EDT. */
+    private static final long AUTOPASS_PACE_MS = 110;
+
     @Override
     public boolean isUiSetToSkipPhase(PlayerView playerTurn, forge.game.phase.PhaseType phase) {
         // true => skip (auto-pass) this empty-stack priority window; false => stop and prompt.
@@ -751,7 +755,13 @@ public class WebGuiGame extends AbstractGuiGame {
         boolean myTurn = humanView != null && playerTurn != null
                 && playerTurn.getId() == humanView.getId();
         java.util.Set<String> stops = myTurn ? stopsMine : stopsOpp;
-        return stops != null && !stops.contains(phase.name()); // stop only at configured phases
+        boolean skip = stops != null && !stops.contains(phase.name()); // stop only at configured phases
+        if (skip && !stopped && MatchBootstrap.onGameThread()) {
+            // Pace the auto-pass so each skipped step is briefly visible; called once per priority
+            // window on the game thread, so it never blocks the EDT or the push/serialize thread.
+            try { Thread.sleep(AUTOPASS_PACE_MS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+        return skip;
     }
 
     @Override
